@@ -15,7 +15,8 @@ cd claudian-bridge
 2. Downloads the Kokoro v1.0 ONNX voice models (`kokoro-v1.0.int8.onnx` & `voices-v1.0.bin`) into `~/.cache/claudian-bridge/models/kokoro/`.
 3. Generates an auth token in `~/.config/claudian-bridge/config.json` (`0600`).
 4. Installs and starts `systemd --user` (`claudian-bridge.service`) on Linux (with `loginctl enable-linger` and `Restart=always`), or starts in background when `systemd --user` is unavailable.
-5. Advertises `_claudian._tcp.local` via mDNS for LAN auto-discovery and prints a **scannable QR code** (`claudian://pair?url=...&token=...`) for 1-tap pairing in **Claudian Call** over LAN or Tailscale.
+5. **Opt-in only** (`./setup.sh --with-compound-engineering`): installs Compound Engineering slash commands (`ce-*`, `lfg`) and instructions into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` for `claude`, `opencode`, and `agy`. Without the flag, setup never edits global agent files or skill symlinks.
+6. Advertises `_claudian._tcp.local` via mDNS for LAN auto-discovery and prints a **scannable QR code** (`claudian://pair?url=...&token=...`) for 1-tap pairing in **Claudian Call** over LAN or Tailscale.
 
 > To run manually without `setup.sh`: `node server.mjs`
 
@@ -41,13 +42,12 @@ cd claudian-bridge
 - `GET / HEAD /apk` — Serves the latest `claudian-call` APK from `dist/claudian-call.apk` or Gradle build outputs
 - `GET /workspaces` — Lists available workspace directories under `CLAUDIAN_WORKSPACES_ROOT`
 - `POST /workspaces` — Creates a new project/topic folder `{ name }` inside `CLAUDIAN_WORKSPACES_ROOT`
-- `GET /workflows` — Lists Compound Engineering workflow presets (`general`, `ce-brainstorm`, `ce-plan`, `ce-work`, `ce-code-review`, `ce-debug`, `ce-compound`)
 - `GET /models?provider=claude|agy|opencode` — Dynamically lists available models for the selected provider (5-minute cache; falls back to `Default (auto)` if a CLI is unavailable)
 - `GET /sessions?cwd=...` — Lists workspace-scoped sessions across `~/.config/claudian-bridge/sessions.json` (all providers), `.claudian/sessions/`, and Claude Code `.jsonl` files
 - `GET /sessions/:sessionId/messages` — Loads session history across all providers
 - `POST /sessions/:sessionId/recap` — Generates a 5-second spoken catch-up summary of recent turns
 - `POST /vault/save` — Saves a dated Markdown note (`{ title, content, workspace, sessionId }`) into `<CLAUDIAN_OBSIDIAN_VAULT>/Voice Notes/`
-- `POST /chat` — Streams SSE events (`session`, `status`, `text`, `done`, `error`) from `claude`, `agy`, or `opencode` with spoken-first formatting, workflow guidance, workspace isolation, and full web/MCP tool access
+- `POST /chat` — Streams SSE events (`session`, `status`, `text`, `done`, `error`) from `claude`, `agy`, or `opencode` in auto mode (`--permission-mode auto` / `--mode auto` / `--auto`) with spoken-first formatting, workspace isolation, and full web/MCP tool access
 - `POST /stt` — Transcribes 16 kHz WAV audio (`audio/wav` binary or `{ wavBase64, language }` JSON) via `faster-whisper` (CUDA with automatic CPU `int8` fallback)
 - `POST /tts` — Synthesizes WAV audio via Kokoro ONNX
 

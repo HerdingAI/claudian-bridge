@@ -382,89 +382,13 @@ const VOICE_OUTPUT_RULES = [
   "5) End with one clear next step or single decision question when input is needed.",
 ].join(" ");
 
-const CE_SKILLS_DIR = path.join(
-  os.homedir(),
-  ".gemini",
-  "config",
-  "plugins",
-  "compound-engineering",
-  "skills"
-);
-
-const WORKFLOW_PRESETS = [
-  {
-    id: "general",
-    label: "General",
-    skill: "",
-    guidance: "Help directly with coding, research, or conversation using clear spoken structure.",
-  },
-  {
-    id: "ce-brainstorm",
-    label: "Brainstorm",
-    skill: "ce-brainstorm",
-    guidance:
-      "Follow Compound Engineering ce-brainstorm: explore scope, requirements, trade-offs, and blindspots before any coding. Ask ONE focused question at a time and keep options crisp for voice.",
-  },
-  {
-    id: "ce-plan",
-    label: "Plan",
-    skill: "ce-plan",
-    guidance:
-      "Follow Compound Engineering ce-plan: produce a concrete step-by-step implementation plan (files, order, risks, verification) summarized clearly by ear.",
-  },
-  {
-    id: "ce-work",
-    label: "Build",
-    skill: "ce-work",
-    guidance:
-      "Follow Compound Engineering ce-work: implement the requested change end-to-end, run relevant tests/checks locally, and report back in 3 spoken parts: 1) What changed, 2) Verification result, 3) Next step.",
-  },
-  {
-    id: "ce-code-review",
-    label: "Review",
-    skill: "ce-code-review",
-    guidance:
-      "Follow Compound Engineering ce-code-review: inspect recent changes for bugs, regressions, edge cases, and missing tests; report findings ordered by severity in concise spoken form.",
-  },
-  {
-    id: "ce-debug",
-    label: "Debug",
-    skill: "ce-debug",
-    guidance:
-      "Follow Compound Engineering ce-debug: diagnose root cause from logs/code, apply the minimal fix, verify with a test/command, and report cause, fix, and verification.",
-  },
-  {
-    id: "ce-compound",
-    label: "Compound",
-    skill: "ce-compound",
-    guidance:
-      "Follow Compound Engineering ce-compound: document the solved problem, root cause, and prevention rule as a durable repo learning (e.g. docs/solutions/) and summarize what was captured.",
-  },
-];
-
-const READ_ONLY_WORKFLOWS = new Set(["ce-brainstorm", "ce-plan", "ce-code-review"]);
-
-function buildVoiceSystemPrompt(customPrompt, workflowId, workspaceDir = DEFAULT_WORKSPACE) {
+function buildVoiceSystemPrompt(customPrompt, workspaceDir = DEFAULT_WORKSPACE) {
   const base = String(customPrompt || "").trim() || VOICE_OUTPUT_RULES;
-  const wfKey = String(workflowId || "general").trim().toLowerCase();
-  const preset = WORKFLOW_PRESETS.find((w) => w.id === wfKey);
-
   const parts = [base];
   if (workspaceDir && workspaceDir !== DEFAULT_WORKSPACE) {
     parts.push(
       `[Workspace Isolation: Keep local file reads, searches, and edits scoped to ${workspaceDir} to avoid pulling unrelated context from sibling projects. Web search, web fetch, and MCP tools remain fully enabled.]`
     );
-  }
-  if (preset && preset.id !== "general") {
-    const readOnlyNote = READ_ONLY_WORKFLOWS.has(preset.id)
-      ? " STRICT READ-ONLY STAGE: Do not edit, write, or delete any files."
-      : "";
-    const skillPath = preset.skill ? path.join(CE_SKILLS_DIR, preset.skill, "SKILL.md") : "";
-    const skillHint =
-      skillPath && fs.existsSync(skillPath)
-        ? ` Follow the Compound Engineering skill instructions at ${skillPath} if applicable.`
-        : "";
-    parts.push(`[Active Workflow: ${preset.label} (${preset.skill})]${readOnlyNote}\n${preset.guidance}${skillHint}`);
   }
   return parts.join("\n\n");
 }
@@ -889,14 +813,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/workflows") {
-    sendJson(res, 200, {
-      ok: true,
-      workflows: WORKFLOW_PRESETS.map(({ id, label, skill }) => ({ id, label, skill })),
-    });
-    return;
-  }
-
   if (req.method === "GET" && url.pathname === "/models") {
     const provider = String(url.searchParams.get("provider") || "claude").toLowerCase();
     try {
@@ -1114,11 +1030,9 @@ const server = http.createServer(async (req, res) => {
         ? requestedCwd
         : DEFAULT_WORKSPACE;
     const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
-    const wfKey = String(body.workflow || "general").trim().toLowerCase();
-    const isReadOnlyWorkflow = READ_ONLY_WORKFLOWS.has(wfKey);
 
     const provider = String(body.provider || "claude").toLowerCase();
-    const finalSystemPrompt = buildVoiceSystemPrompt(body.systemPrompt, wfKey, workspaceDir);
+    const finalSystemPrompt = buildVoiceSystemPrompt(body.systemPrompt, workspaceDir);
     const effectivePrompt =
       provider !== "claude" && finalSystemPrompt
         ? `[Instructions: ${finalSystemPrompt}]\n\n${prompt}`
@@ -1134,14 +1048,13 @@ const server = http.createServer(async (req, res) => {
         "--output-format",
         "stream-json",
         "--mode",
-        isReadOnlyWorkflow ? "plan" : "accept-edits",
+        "auto",
       ];
       if (body.sessionId) args.push("--conversation", String(body.sessionId));
       if (body.model) args.push("--model", String(body.model));
     } else if (provider === "opencode") {
       bin = OPENCODE_BIN;
-      args = ["run", effectivePrompt, "--format", "json"];
-      if (!isReadOnlyWorkflow) args.push("--auto");
+      args = ["run", effectivePrompt, "--format", "json", "--auto"];
       if (body.sessionId) args.push("-s", String(body.sessionId));
       if (body.model) args.push("-m", String(body.model));
     } else {
@@ -1154,7 +1067,7 @@ const server = http.createServer(async (req, res) => {
         "--include-partial-messages",
         "--verbose",
         "--permission-mode",
-        isReadOnlyWorkflow ? "plan" : "acceptEdits",
+        "auto",
       ];
       if (body.sessionId) args.push("--resume", String(body.sessionId));
       if (body.model) args.push("--model", String(body.model));
