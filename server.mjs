@@ -62,6 +62,10 @@ export function createServer(opts = {}) {
     (fs.existsSync(path.join(homeDir, "dev")) ? path.join(homeDir, "dev") : homeDir);
   const WORKSPACES_ROOT = opts.workspacesRoot || env.CLAUDIAN_WORKSPACES_ROOT || DEFAULT_WORKSPACE;
   const VAULT_DIR = DEFAULT_WORKSPACE;
+  // Antigravity (agy) is off unless the owner opts in on this computer.
+  const ENABLE_AGY = opts.enableAgy ?? env.CLAUDIAN_ENABLE_AGY === "1";
+  const AGY_DISABLED_MESSAGE = "Antigravity is disabled on this computer (set CLAUDIAN_ENABLE_AGY=1)";
+  const isAgyProvider = (p) => p === "agy" || p === "antigravity";
   const OBSIDIAN_VAULT_DIR = env.CLAUDIAN_OBSIDIAN_VAULT || DEFAULT_WORKSPACE;
 
   const CLAUDE_BIN = resolveBin(env, env.CLAUDIAN_CLAUDE_BIN, "claude", [
@@ -727,7 +731,7 @@ export function createServer(opts = {}) {
         ok: true,
         vault: VAULT_DIR,
         claude: fs.existsSync(CLAUDE_BIN),
-        agy: fs.existsSync(AGY_BIN),
+        agy: ENABLE_AGY && fs.existsSync(AGY_BIN),
         opencode: fs.existsSync(OPENCODE_BIN),
         stt: fs.existsSync(STT_WORKER),
         tts: fs.existsSync(KOKORO_WORKER),
@@ -825,6 +829,10 @@ export function createServer(opts = {}) {
 
     if (req.method === "GET" && url.pathname === "/models") {
       const provider = String(url.searchParams.get("provider") || "claude").toLowerCase();
+      if (isAgyProvider(provider) && !ENABLE_AGY) {
+        sendJson(res, 400, { ok: false, provider, models: [], error: AGY_DISABLED_MESSAGE });
+        return;
+      }
       try {
         const models = await listProviderModels(provider);
         sendJson(res, 200, { ok: true, provider, models });
@@ -1042,6 +1050,11 @@ export function createServer(opts = {}) {
       const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
 
       const provider = String(body.provider || "claude").toLowerCase();
+      if (isAgyProvider(provider) && !ENABLE_AGY) {
+        writeEvent("error", { error: AGY_DISABLED_MESSAGE });
+        res.end();
+        return;
+      }
       const finalSystemPrompt = buildVoiceSystemPrompt(body.systemPrompt, workspaceDir);
       const effectivePrompt =
         provider !== "claude" && finalSystemPrompt

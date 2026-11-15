@@ -42,7 +42,7 @@ cd claudian-bridge
 - `GET / HEAD /apk` — Serves the latest `claudian-call` APK from `dist/claudian-call.apk` or Gradle build outputs
 - `GET /workspaces` — Lists available workspace directories under `CLAUDIAN_WORKSPACES_ROOT`
 - `POST /workspaces` — Creates a new project/topic folder `{ name }` inside `CLAUDIAN_WORKSPACES_ROOT`
-- `GET /models?provider=claude|agy|opencode` — Dynamically lists available models for the selected provider (5-minute cache; falls back to `Default (auto)` if a CLI is unavailable)
+- `GET /models?provider=claude|agy|opencode` — (`agy` is disabled unless `CLAUDIAN_ENABLE_AGY=1`; `/chat` with `agy`/`antigravity` returns an error event too) Dynamically lists available models for the selected provider (5-minute cache; falls back to `Default (auto)` if a CLI is unavailable)
 - `GET /sessions?cwd=...` — Lists workspace-scoped sessions across `~/.config/claudian-bridge/sessions.json` (all providers), `.claudian/sessions/`, and Claude Code `.jsonl` files
 - `GET /sessions/:sessionId/messages` — Loads session history across all providers
 - `POST /sessions/:sessionId/recap` — Generates a 5-second spoken catch-up summary of recent turns
