@@ -1,0 +1,232 @@
+#!/usr/bin/env node
+// Fake `claude` CLI for bridge tests. Replays stream-json (JSON lines) on stdout.
+//
+// Scenario comes from env FAKE_SCENARIO (default "normal"). Optional env:
+//   FAKE_LOG      append one JSON line {pid,argv,cwd,scenario} per invocation
+//   FAKE_DELAY_MS gap between emitted events (default 0; "slow" uses 300)
+//   FAKE_IGNORE_SIGTERM=1  swallow SIGTERM (to test SIGKILL escalation)
+//
+// Ground truth: tests/fixtures/recorded/claude-normal.jsonl is a real recording of
+//   claude -p "Reply with exactly: pong" --output-format stream-json --verbose --model haiku
+// (claude 2.1.x, sanitized). Its schema (system/init, assistant, rate_limit_event,
+// result) is what every scenario below is built on. The recording has no
+// `stream_event` lines because that run did not use --include-partial-messages; those
+// are synthesized here from the documented Anthropic streaming shape (marked SYNTH).
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const scenario = process.env.FAKE_SCENARIO || "normal";
+const argv = process.argv.slice(2);
+const argVal = (flag) => {
+  const i = argv.indexOf(flag);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+
+if (process.env.FAKE_LOG) {
+  fs.appendFileSync(
+    process.env.FAKE_LOG,
+    JSON.stringify({ pid: process.pid, argv, cwd: process.cwd(), scenario }) + "\n"
+  );
+}
+if (process.env.FAKE_IGNORE_SIGTERM === "1") process.on("SIGTERM", () => {});
+
+const recorded = fs
+  .readFileSync(path.join(here, "recorded", "claude-normal.jsonl"), "utf8")
+  .split("\n")
+  .filter(Boolean)
+  .map((l) => JSON.parse(l));
+const rec = (pred) => recorded.find(pred);
+
+const sessionId = argVal("--resume") || process.env.FAKE_SESSION_ID || "11111111-2222-4333-8444-555555555555";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const gap = Number(process.env.FAKE_DELAY_MS || (scenario === "slow" ? 300 : 0));
+const withSid = (o) => ({ ...o, session_id: sessionId });
+const emit = async (o) => {
+  process.stdout.write(JSON.stringify(withSid(o)) + "\n");
+  if (gap) await sleep(gap);
+};
+
+const initEvent = () => ({ ...rec((e) => e.subtype === "init"), model: argVal("--model") || "haiku", cwd: process.cwd() });
+const assistantMsg = (content, extra = {}) => ({
+  ...rec((e) => e.type === "assistant"),
+  ...extra,
+  message: { ...rec((e) => e.type === "assistant").message, content },
+});
+const resultEvent = (text, extra = {}) => ({ ...rec((e) => e.type === "result"), result: text, ...extra });
+// SYNTH: --include-partial-messages shape
+const textDelta = (text, index = 0) => ({
+  type: "stream_event",
+  event: { type: "content_block_delta", index, delta: { type: "text_delta", text } },
+});
+const toolStart = (name, id, index = 1) => ({
+  type: "stream_event",
+  event: { type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {} } },
+});
+const toolUse = (id, name, input, parent = null) =>
+  assistantMsg([{ type: "tool_use", id, name, input }], { parent_tool_use_id: parent });
+const toolResult = (id, content, extra = {}, parent = null) => ({
+  type: "user",
+  parent_tool_use_id: parent,
+  message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, ...extra }] },
+});
+
+async function textReply(words) {
+  let full = "";
+  for (const w of words) {
+    full += w;
+    await emit(textDelta(w));
+  }
+  await emit(assistantMsg([{ type: "text", text: full }]));
+  return full;
+}
+
+async function main() {
+  switch (scenario) {
+    case "normal": {
+      await emit(initEvent());
+      const full = await textReply(["po", "ng"]);
+      await emit(rec((e) => e.type === "rate_limit_event"));
+      await emit(resultEvent(full));
+      break;
+    }
+    case "long_tools": {
+      await emit(initEvent());
+      const tools = [
+        ["Read", { file_path: "/tmp/ws/server.mjs" }, "file contents"],
+        ["Grep", { pattern: "TODO" }, "3 matches"],
+        ["Bash", { command: "npm test" }, "ok 12 tests"],
+        ["Edit", { file_path: "/tmp/ws/server.mjs" }, "edited"],
+        ["WebSearch", { query: "node test runner" }, "results"],
+      ];
+      let n = 0;
+      for (const [name, input, out] of tools) {
+        const id = `toolu_fake_${++n}`;
+        await emit(toolStart(name, id));
+        await emit(toolUse(id, name, input));
+        await emit(toolResult(id, out));
+      }
+      const full = await textReply(["All ", "done."]);
+      await emit(resultEvent(full, { num_turns: 6 }));
+      break;
+    }
+    case "subagents": {
+      await emit(initEvent());
+      await emit(toolStart("Task", "toolu_task_1"));
+      await emit(toolUse("toolu_task_1", "Task", { description: "explore", prompt: "look around", subagent_type: "Explore" }));
+      // messages produced inside the subagent carry parent_tool_use_id
+      await emit(toolUse("toolu_sub_1", "Read", { file_path: "/tmp/ws/a.txt" }, "toolu_task_1"));
+      await emit(toolResult("toolu_sub_1", "a", {}, "toolu_task_1"));
+      await emit(assistantMsg([{ type: "text", text: "subagent chatter" }], { parent_tool_use_id: "toolu_task_1" }));
+      await emit(toolResult("toolu_task_1", "subagent report"));
+      const full = await textReply(["Subagent ", "finished."]);
+      await emit(resultEvent(full, { subagent_stats: { spawned: 1 } }));
+      break;
+    }
+    case "permission_request": {
+      // TODO(M3 spike): real shape of a permission request is unknown. Best guess based on what
+      // `claude -p` does today without a broker: the tool call fails with an is_error tool_result
+      // and the result event lists it in permission_denials. Replace once the spike picks a mechanism.
+      await emit(initEvent());
+      await emit(toolStart("Bash", "toolu_perm_1"));
+      await emit(toolUse("toolu_perm_1", "Bash", { command: "rm -rf /tmp/ws/build" }));
+      await emit(
+        toolResult(
+          "toolu_perm_1",
+          "Claude requested permissions to use Bash, but you haven't granted it yet.",
+          { is_error: true }
+        )
+      );
+      const full = await textReply(["I need ", "permission to run that."]);
+      await emit(
+        resultEvent(full, {
+          permission_denials: [{ tool_name: "Bash", tool_use_id: "toolu_perm_1", tool_input: { command: "rm -rf /tmp/ws/build" } }],
+        })
+      );
+      break;
+    }
+    case "partial_then_crash": {
+      await emit(initEvent());
+      await emit(textDelta("Working on "));
+      await emit(textDelta("it, then"));
+      process.stderr.write("fake-claude: simulated crash\n");
+      process.exit(1);
+      break;
+    }
+    case "empty":
+      process.exit(0);
+      break;
+    case "hang":
+      // Print nothing, never exit; only a signal ends us.
+      setInterval(() => {}, 1 << 30);
+      return;
+    case "slow": {
+      await emit(initEvent());
+      const full = await textReply(["one ", "two ", "three"]);
+      await emit(resultEvent(full));
+      break;
+    }
+    case "huge": {
+      // >= 5 MB of output: 20 deltas of 256 KiB each.
+      await emit(initEvent());
+      const chunk = "x".repeat(256 * 1024);
+      let full = "";
+      for (let i = 0; i < 20; i++) {
+        full += chunk;
+        await emit(textDelta(chunk));
+      }
+      await emit(assistantMsg([{ type: "text", text: full }]));
+      await emit(resultEvent(full));
+      break;
+    }
+    case "non_utf8": {
+      // Raw bytes on stdout: (1) a multi-byte char (e-acute, C3 A9) split across two writes,
+      // (2) a lone invalid byte 0xFF inside a JSON string.
+      await emit(initEvent());
+      const line = Buffer.from(JSON.stringify(withSid(textDelta("héllo"))) + "\n", "utf8");
+      const split = line.indexOf(0xc3) + 1;
+      process.stdout.write(line.subarray(0, split));
+      await sleep(80);
+      process.stdout.write(line.subarray(split));
+      await sleep(80);
+      const bad = Buffer.concat([
+        Buffer.from('{"type":"stream_event","session_id":"' + sessionId + '","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad'),
+        Buffer.from([0xff]),
+        Buffer.from('byte"}}}\n'),
+      ]);
+      process.stdout.write(bad);
+      await emit(resultEvent("ok"));
+      break;
+    }
+    case "quota_exhausted": {
+      // BEST GUESS of what claude -p prints at a usage limit: a rate_limit_event with status
+      // "rejected" (field shape taken from the recording), then an error result whose text is
+      // the human message, exit 1. Re-record when a real one is available.
+      await emit(initEvent());
+      const rl = structuredClone(rec((e) => e.type === "rate_limit_event"));
+      rl.rate_limit_info.status = "rejected";
+      await emit(rl);
+      const msg = "You've hit your limit · resets 3pm (America/New_York)";
+      await emit(assistantMsg([{ type: "text", text: msg }], { error: "rate_limit" }));
+      await emit(resultEvent(msg, { is_error: true, subtype: "success", api_error_status: 429 }));
+      process.exit(1);
+      break;
+    }
+    case "recap_text":
+      process.stdout.write("Recap sentence one. Two. Three.\n");
+      break;
+    default:
+      process.stderr.write(`fake-claude: unknown FAKE_SCENARIO ${scenario}\n`);
+      process.exit(64);
+  }
+}
+
+// `claude -p ... --output-format text` (used by /recap) prints plain text, not stream-json.
+if (argVal("--output-format") === "text") {
+  if (scenario === "hang") setInterval(() => {}, 1 << 30);
+  else if (scenario === "partial_then_crash" || scenario === "quota_exhausted") process.exit(1);
+  else process.stdout.write("Recap sentence one. Sentence two. Sentence three.\n");
+} else {
+  await main();
+}

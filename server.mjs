@@ -1455,6 +1455,7 @@ export function createServer(opts = {}) {
     ttsWorker,
     get port() { return PORT; },
     host: HOST,
+    env, // the env handed to agent children; tests mutate it to switch fake scenarios
     token: AUTH_TOKEN,
     configDir: CONFIG_DIR,
     configPath: CONFIG_PATH,

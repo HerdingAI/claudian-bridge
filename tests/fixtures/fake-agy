@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+// Fake `agy` (Antigravity) CLI. Shape is a best guess from server.mjs's parser
+// (event: step_update | result), not a recording. Its existence lets tests prove the
+// bridge does NOT spawn agy when CLAUDIAN_ENABLE_AGY is off.
+import fs from "node:fs";
+const argv = process.argv.slice(2);
+if (process.env.FAKE_LOG) {
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ pid: process.pid, argv, cwd: process.cwd(), bin: "agy" }) + "\n");
+}
+if (argv[0] === "models") {
+  process.stdout.write("Fetching models\nfake-model\tFake Model\n");
+} else {
+  const c = "fake-conversation-1";
+  const out = (o) => process.stdout.write(JSON.stringify({ conversation_id: c, ...o }) + "\n");
+  out({ event: "step_update", step_update: { text_delta: "agy says hi" } });
+  out({ event: "result", result: { response: "agy says hi", conversation_id: c } });
+}
