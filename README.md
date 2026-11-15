@@ -51,3 +51,13 @@ For always-on operation across reboots and power loss, run via `systemd --user` 
 - Enforces startup (`60s`) and per-request (`45s`) worker timeouts, sends 15-second SSE `: keepalive` heartbeats on `/chat`, and automatically respawns crashed Python workers.
 - Sweeps stale `/tmp/bridge-stt-*.wav` and `/tmp/bridge-tts-*.wav` files on startup and shuts down workers cleanly on `SIGTERM`/`SIGINT`.
 - Run `./setup.sh` for guided community installation, or package with `tar -czf dist/claudian-bridge-0.1.0.tar.gz server.mjs stt_worker.py setup.sh package.json README.md LICENSE`.
+
+## Claudian Suite
+
+- **[Claudian Mobile](https://github.com/HerdingAI/claudian-mobile)** — Mobile-compatible (`isDesktopOnly: false`) Obsidian plugin for iOS, Android, and Desktop that connects to `claudian-bridge`.
+- **[Claudian Call](https://github.com/HerdingAI/claudian-call)** — Native Android app for screen-off, phone-call-style voice conversations with `claudian-bridge`.
+- **[Claudian Voice](https://github.com/HerdingAI/claudian-voice)** — Desktop Obsidian plugin adding local `faster-whisper` STT and Kokoro TTS directly to Claudian.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
