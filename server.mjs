@@ -9,9 +9,9 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function resolveBin(envVal, name, extraCandidates = [], preferExtra = false) {
+function resolveBin(env, envVal, name, extraCandidates = [], preferExtra = false) {
   if (envVal && fs.existsSync(envVal)) return envVal;
-  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const pathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
   const dirs = preferExtra ? [...extraCandidates, ...pathDirs] : [...pathDirs, ...extraCandidates];
   for (const dir of dirs) {
     const full = path.join(dir, name);
@@ -20,8 +20,8 @@ function resolveBin(envVal, name, extraCandidates = [], preferExtra = false) {
   return envVal || name;
 }
 
-function buildWorkerEnv(pythonBin) {
-  const env = { ...process.env, PYTHONUNBUFFERED: "1" };
+function buildWorkerEnv(baseEnv, pythonBin) {
+  const env = { ...baseEnv, PYTHONUNBUFFERED: "1" };
   try {
     const venvRoot = path.dirname(path.dirname(pythonBin));
     const libRoot = path.join(venvRoot, "lib");
@@ -47,1379 +47,1458 @@ function buildWorkerEnv(pythonBin) {
   return env;
 }
 
-const PORT = Number(process.env.CLAUDIAN_BRIDGE_PORT || 8790);
-const HOST = process.env.CLAUDIAN_BRIDGE_HOST || "0.0.0.0";
-const DEFAULT_WORKSPACE =
-  process.env.CLAUDIAN_WORKSPACE_DIR ||
-  process.env.CLAUDIAN_VAULT_DIR ||
-  (fs.existsSync(path.join(os.homedir(), "dev")) ? path.join(os.homedir(), "dev") : os.homedir());
-const WORKSPACES_ROOT = process.env.CLAUDIAN_WORKSPACES_ROOT || DEFAULT_WORKSPACE;
-const VAULT_DIR = DEFAULT_WORKSPACE;
-const OBSIDIAN_VAULT_DIR = process.env.CLAUDIAN_OBSIDIAN_VAULT || DEFAULT_WORKSPACE;
+export function createServer(opts = {}) {
+  // `env` is the environment the bridge reads its config from AND hands to agent
+  // children (so tests can put fake CLIs first on PATH). `homeDir` replaces
+  // os.homedir() so tests never touch the real ~/.claude or ~/.config.
+  const env = { ...process.env, ...(opts.env || {}) };
+  const homeDir = opts.homeDir || os.homedir();
+  let PORT = Number(opts.port ?? (env.CLAUDIAN_BRIDGE_PORT || 8790));
+  const HOST = opts.host || env.CLAUDIAN_BRIDGE_HOST || "0.0.0.0";
+  const DEFAULT_WORKSPACE =
+    opts.workspaceDir ||
+    env.CLAUDIAN_WORKSPACE_DIR ||
+    env.CLAUDIAN_VAULT_DIR ||
+    (fs.existsSync(path.join(homeDir, "dev")) ? path.join(homeDir, "dev") : homeDir);
+  const WORKSPACES_ROOT = opts.workspacesRoot || env.CLAUDIAN_WORKSPACES_ROOT || DEFAULT_WORKSPACE;
+  const VAULT_DIR = DEFAULT_WORKSPACE;
+  const OBSIDIAN_VAULT_DIR = env.CLAUDIAN_OBSIDIAN_VAULT || DEFAULT_WORKSPACE;
 
-const CLAUDE_BIN = resolveBin(process.env.CLAUDIAN_CLAUDE_BIN, "claude", [
-  path.join(os.homedir(), ".local", "bin"),
-  "/usr/local/bin",
-]);
-const AGY_BIN = resolveBin(process.env.CLAUDIAN_AGY_BIN, "agy", [
-  path.join(os.homedir(), ".local", "bin"),
-  "/usr/local/bin",
-]);
-const OPENCODE_BIN = resolveBin(process.env.CLAUDIAN_OPENCODE_BIN, "opencode", [
-  path.join(os.homedir(), ".local", "bin"),
-  "/usr/local/bin",
-]);
-const STT_PYTHON = resolveBin(
-  process.env.CLAUDIAN_STT_PYTHON,
-  "python3",
-  [path.join(os.homedir(), ".venvs", "audio", "bin")],
-  true
-);
-const STT_WORKER =
-  process.env.CLAUDIAN_STT_WORKER ||
-  (fs.existsSync(path.join(__dirname, "stt_worker.py"))
-    ? path.join(__dirname, "stt_worker.py")
-    : path.resolve(__dirname, "../claudian-voice/stt_worker.py"));
-function firstExisting(candidates) {
-  for (const p of candidates) {
-    if (p && fs.existsSync(p)) return p;
-  }
-  return candidates[0];
-}
-
-const KOKORO_CACHE_BRIDGE = path.join(os.homedir(), ".cache", "claudian-bridge");
-const KOKORO_CACHE_READ_ALOUD = path.join(os.homedir(), ".cache", "obsidian-read-aloud");
-const KOKORO_ROOT =
-  process.env.CLAUDIAN_KOKORO_ROOT ||
-  (fs.existsSync(path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro"))
-    ? KOKORO_CACHE_BRIDGE
-    : KOKORO_CACHE_READ_ALOUD);
-const KOKORO_PYTHON = firstExisting([
-  process.env.CLAUDIAN_KOKORO_PYTHON,
-  path.join(KOKORO_ROOT, "venv", "bin", "python"),
-  path.join(KOKORO_CACHE_READ_ALOUD, "venv", "bin", "python"),
-  STT_PYTHON,
-]);
-const KOKORO_WORKER = firstExisting([
-  process.env.CLAUDIAN_KOKORO_WORKER,
-  path.join(__dirname, "kokoro_worker.py"),
-  path.join(KOKORO_ROOT, "kokoro_worker.py"),
-]);
-const KOKORO_MODEL = firstExisting([
-  path.join(KOKORO_ROOT, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
-  path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
-  path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
-]);
-const KOKORO_VOICES = firstExisting([
-  path.join(KOKORO_ROOT, "models", "kokoro", "voices-v1.0.bin"),
-  path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "voices-v1.0.bin"),
-  path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "voices-v1.0.bin"),
-]);
-
-function resolveApkPaths() {
-  const candidates = [
-    process.env.CLAUDIAN_CALL_APK,
-    path.join(__dirname, "claudian-call.apk"),
-    path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/direct/debug/app-direct-debug.apk"),
-    path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/debug/app-debug.apk"),
-    path.resolve(__dirname, "../claudian-call/dist/claudian-call.apk"),
-  ].filter(Boolean);
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      return {
-        apkPath: p,
-        metaPath: path.join(path.dirname(p), "output-metadata.json"),
-      };
+  const CLAUDE_BIN = resolveBin(env, env.CLAUDIAN_CLAUDE_BIN, "claude", [
+    path.join(homeDir, ".local", "bin"),
+    "/usr/local/bin",
+  ]);
+  const AGY_BIN = resolveBin(env, env.CLAUDIAN_AGY_BIN, "agy", [
+    path.join(homeDir, ".local", "bin"),
+    "/usr/local/bin",
+  ]);
+  const OPENCODE_BIN = resolveBin(env, env.CLAUDIAN_OPENCODE_BIN, "opencode", [
+    path.join(homeDir, ".local", "bin"),
+    "/usr/local/bin",
+  ]);
+  const STT_PYTHON = resolveBin(
+    env,
+    env.CLAUDIAN_STT_PYTHON,
+    "python3",
+    [path.join(homeDir, ".venvs", "audio", "bin")],
+    true
+  );
+  const STT_WORKER =
+    env.CLAUDIAN_STT_WORKER ||
+    (fs.existsSync(path.join(__dirname, "stt_worker.py"))
+      ? path.join(__dirname, "stt_worker.py")
+      : path.resolve(__dirname, "../claudian-voice/stt_worker.py"));
+  function firstExisting(candidates) {
+    for (const p of candidates) {
+      if (p && fs.existsSync(p)) return p;
     }
+    return candidates[0];
   }
-  return {
-    apkPath: candidates[candidates.length - 1],
-    metaPath: path.join(path.dirname(candidates[candidates.length - 1]), "output-metadata.json"),
-  };
-}
 
-const CONFIG_DIR = path.join(os.homedir(), ".config", "claudian-bridge");
-const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+  const KOKORO_CACHE_BRIDGE = path.join(homeDir, ".cache", "claudian-bridge");
+  const KOKORO_CACHE_READ_ALOUD = path.join(homeDir, ".cache", "obsidian-read-aloud");
+  const KOKORO_ROOT =
+    env.CLAUDIAN_KOKORO_ROOT ||
+    (fs.existsSync(path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro"))
+      ? KOKORO_CACHE_BRIDGE
+      : KOKORO_CACHE_READ_ALOUD);
+  const KOKORO_PYTHON = firstExisting([
+    env.CLAUDIAN_KOKORO_PYTHON,
+    path.join(KOKORO_ROOT, "venv", "bin", "python"),
+    path.join(KOKORO_CACHE_READ_ALOUD, "venv", "bin", "python"),
+    STT_PYTHON,
+  ]);
+  const KOKORO_WORKER = firstExisting([
+    env.CLAUDIAN_KOKORO_WORKER,
+    path.join(__dirname, "kokoro_worker.py"),
+    path.join(KOKORO_ROOT, "kokoro_worker.py"),
+  ]);
+  const KOKORO_MODEL = firstExisting([
+    path.join(KOKORO_ROOT, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+    path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+    path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+  ]);
+  const KOKORO_VOICES = firstExisting([
+    path.join(KOKORO_ROOT, "models", "kokoro", "voices-v1.0.bin"),
+    path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "voices-v1.0.bin"),
+    path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "voices-v1.0.bin"),
+  ]);
 
-function loadOrCreateToken() {
-  if (process.env.CLAUDIAN_BRIDGE_TOKEN) {
-    return process.env.CLAUDIAN_BRIDGE_TOKEN;
+  function resolveApkPaths() {
+    const candidates = [
+      env.CLAUDIAN_CALL_APK,
+      path.join(__dirname, "claudian-call.apk"),
+      path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/direct/debug/app-direct-debug.apk"),
+      path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/debug/app-debug.apk"),
+      path.resolve(__dirname, "../claudian-call/dist/claudian-call.apk"),
+    ].filter(Boolean);
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        return {
+          apkPath: p,
+          metaPath: path.join(path.dirname(p), "output-metadata.json"),
+        };
+      }
+    }
+    return {
+      apkPath: candidates[candidates.length - 1],
+      metaPath: path.join(path.dirname(candidates[candidates.length - 1]), "output-metadata.json"),
+    };
   }
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  if (fs.existsSync(CONFIG_PATH)) {
+
+  const CONFIG_DIR = opts.configDir || path.join(homeDir, ".config", "claudian-bridge");
+  const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+
+  function loadOrCreateToken() {
+    if (opts.token) return opts.token;
+    if (env.CLAUDIAN_BRIDGE_TOKEN) {
+      return env.CLAUDIAN_BRIDGE_TOKEN;
+    }
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    if (fs.existsSync(CONFIG_PATH)) {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+        if (cfg.token) return cfg.token;
+      } catch {
+        // regenerate
+      }
+    }
+    const token = crypto.randomBytes(24).toString("hex");
+    const tmpPath = `${CONFIG_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify({ token }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmpPath, CONFIG_PATH);
+    return token;
+  }
+
+  const AUTH_TOKEN = loadOrCreateToken();
+
+  function cleanupStaleTempFiles(maxAgeMs = 5 * 60 * 1000) {
     try {
-      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-      if (cfg.token) return cfg.token;
+      const tmpDir = os.tmpdir();
+      const now = Date.now();
+      for (const name of fs.readdirSync(tmpDir)) {
+        if (!name.startsWith("bridge-stt-") && !name.startsWith("bridge-tts-")) continue;
+        if (!name.endsWith(".wav")) continue;
+        const full = path.join(tmpDir, name);
+        try {
+          const st = fs.statSync(full);
+          if (now - st.mtimeMs > maxAgeMs) fs.unlinkSync(full);
+        } catch {
+          // ignore race
+        }
+      }
     } catch {
-      // regenerate
-    }
-  }
-  const token = crypto.randomBytes(24).toString("hex");
-  const tmpPath = `${CONFIG_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify({ token }, null, 2), { mode: 0o600 });
-  fs.renameSync(tmpPath, CONFIG_PATH);
-  return token;
-}
-
-const AUTH_TOKEN = loadOrCreateToken();
-
-function cleanupStaleTempFiles(maxAgeMs = 5 * 60 * 1000) {
-  try {
-    const tmpDir = os.tmpdir();
-    const now = Date.now();
-    for (const name of fs.readdirSync(tmpDir)) {
-      if (!name.startsWith("bridge-stt-") && !name.startsWith("bridge-tts-")) continue;
-      if (!name.endsWith(".wav")) continue;
-      const full = path.join(tmpDir, name);
-      try {
-        const st = fs.statSync(full);
-        if (now - st.mtimeMs > maxAgeMs) fs.unlinkSync(full);
-      } catch {
-        // ignore race
-      }
-    }
-  } catch {
-    // ignore
-  }
-}
-
-class PersistentJsonWorker {
-  constructor(name, cmd, args) {
-    this.name = name;
-    this.cmd = cmd;
-    this.args = args;
-    this.proc = null;
-    this.readyPromise = null;
-    this.buf = "";
-    this.pendingResolve = null;
-    this.pendingReject = null;
-    this.queue = Promise.resolve();
-  }
-
-  dispose() {
-    const proc = this.proc;
-    this.proc = null;
-    this.readyPromise = null;
-    if (proc && !proc.killed) {
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
+      // ignore
     }
   }
 
-  ensure() {
-    if (this.proc && this.readyPromise) return this.readyPromise;
-    this.readyPromise = new Promise((resolve, reject) => {
-      let settled = false;
-      let stderrTail = "";
-      const child = spawn(this.cmd, this.args, {
-        env: buildWorkerEnv(this.cmd),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      this.proc = child;
+  class PersistentJsonWorker {
+    constructor(name, cmd, args) {
+      this.name = name;
+      this.cmd = cmd;
+      this.args = args;
+      this.proc = null;
+      this.readyPromise = null;
       this.buf = "";
+      this.pendingResolve = null;
+      this.pendingReject = null;
+      this.queue = Promise.resolve();
+    }
 
-      const startTimer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          this.dispose();
-          reject(new Error(`${this.name} startup timed out`));
+    dispose() {
+      const proc = this.proc;
+      this.proc = null;
+      this.readyPromise = null;
+      if (proc && !proc.killed) {
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // ignore
         }
-      }, 60_000);
+      }
+    }
 
-      child.stderr.on("data", (c) => {
-        stderrTail = (stderrTail + c.toString("utf8")).slice(-1000);
-      });
+    ensure() {
+      if (this.proc && this.readyPromise) return this.readyPromise;
+      this.readyPromise = new Promise((resolve, reject) => {
+        let settled = false;
+        let stderrTail = "";
+        const child = spawn(this.cmd, this.args, {
+          env: buildWorkerEnv(env, this.cmd),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        this.proc = child;
+        this.buf = "";
 
-      child.stdout.on("data", (chunk) => {
-        this.buf += chunk.toString("utf8");
-        let idx;
-        while ((idx = this.buf.indexOf("\n")) !== -1) {
-          const line = this.buf.slice(0, idx).trim();
-          this.buf = this.buf.slice(idx + 1);
-          if (!line) continue;
+        const startTimer = setTimeout(() => {
           if (!settled) {
-            if (!line.startsWith("{")) continue;
-            try {
-              const msg = JSON.parse(line);
-              clearTimeout(startTimer);
-              if (msg.ready) {
-                settled = true;
-                resolve();
-              } else {
-                settled = true;
-                this.dispose();
-                reject(new Error(msg.error || `${this.name} init failed`));
+            settled = true;
+            this.dispose();
+            reject(new Error(`${this.name} startup timed out`));
+          }
+        }, 60_000);
+
+        child.stderr.on("data", (c) => {
+          stderrTail = (stderrTail + c.toString("utf8")).slice(-1000);
+        });
+
+        child.stdout.on("data", (chunk) => {
+          this.buf += chunk.toString("utf8");
+          let idx;
+          while ((idx = this.buf.indexOf("\n")) !== -1) {
+            const line = this.buf.slice(0, idx).trim();
+            this.buf = this.buf.slice(idx + 1);
+            if (!line) continue;
+            if (!settled) {
+              if (!line.startsWith("{")) continue;
+              try {
+                const msg = JSON.parse(line);
+                clearTimeout(startTimer);
+                if (msg.ready) {
+                  settled = true;
+                  resolve();
+                } else {
+                  settled = true;
+                  this.dispose();
+                  reject(new Error(msg.error || `${this.name} init failed`));
+                }
+              } catch {
+                // ignore non-json startup line
               }
-            } catch {
-              // ignore non-json startup line
+              continue;
             }
-            continue;
-          }
-          if (this.pendingResolve) {
-            if (!line.startsWith("{")) continue;
-            try {
-              const parsed = JSON.parse(line);
-              const fn = this.pendingResolve;
-              this.pendingResolve = null;
-              this.pendingReject = null;
-              fn(parsed);
-            } catch {
-              // ignore malformed stdout line
+            if (this.pendingResolve) {
+              if (!line.startsWith("{")) continue;
+              try {
+                const parsed = JSON.parse(line);
+                const fn = this.pendingResolve;
+                this.pendingResolve = null;
+                this.pendingReject = null;
+                fn(parsed);
+              } catch {
+                // ignore malformed stdout line
+              }
             }
           }
-        }
-      });
+        });
 
-      child.on("error", (spawnErr) => {
-        clearTimeout(startTimer);
-        const err = new Error(`${this.name} spawn error: ${spawnErr.message}`);
-        if (!settled) {
-          settled = true;
-          reject(err);
-        } else if (this.pendingReject) {
-          const fn = this.pendingReject;
-          this.pendingResolve = null;
-          this.pendingReject = null;
-          fn(err);
-        }
-        this.proc = null;
-        this.readyPromise = null;
-      });
-
-      child.on("close", (code) => {
-        clearTimeout(startTimer);
-        const detail = stderrTail.trim() ? `: ${stderrTail.trim().slice(-200)}` : "";
-        const err = new Error(`${this.name} exited (${code})${detail}`);
-        if (!settled) {
-          settled = true;
-          reject(err);
-        } else if (this.pendingReject) {
-          const fn = this.pendingReject;
-          this.pendingResolve = null;
-          this.pendingReject = null;
-          fn(err);
-        }
-        this.proc = null;
-        this.readyPromise = null;
-      });
-    });
-    return this.readyPromise;
-  }
-
-  request(payload, timeoutMs = 45_000) {
-    const run = async () => {
-      await this.ensure();
-      return await new Promise((resolve, reject) => {
-        if (!this.proc) return reject(new Error(`${this.name} not running`));
-        const timer = setTimeout(() => {
-          if (this.pendingReject) {
+        child.on("error", (spawnErr) => {
+          clearTimeout(startTimer);
+          const err = new Error(`${this.name} spawn error: ${spawnErr.message}`);
+          if (!settled) {
+            settled = true;
+            reject(err);
+          } else if (this.pendingReject) {
             const fn = this.pendingReject;
             this.pendingResolve = null;
             this.pendingReject = null;
-            this.dispose();
-            fn(new Error(`${this.name} request timed out after ${timeoutMs}ms`));
+            fn(err);
           }
-        }, timeoutMs);
+          this.proc = null;
+          this.readyPromise = null;
+        });
 
-        this.pendingResolve = (val) => {
-          clearTimeout(timer);
-          resolve(val);
-        };
-        this.pendingReject = (err) => {
-          clearTimeout(timer);
-          reject(err);
-        };
-        try {
-          this.proc.stdin.write(JSON.stringify(payload) + "\n");
-        } catch (err) {
-          clearTimeout(timer);
-          this.pendingResolve = null;
-          this.pendingReject = null;
-          this.dispose();
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
+        child.on("close", (code) => {
+          clearTimeout(startTimer);
+          const detail = stderrTail.trim() ? `: ${stderrTail.trim().slice(-200)}` : "";
+          const err = new Error(`${this.name} exited (${code})${detail}`);
+          if (!settled) {
+            settled = true;
+            reject(err);
+          } else if (this.pendingReject) {
+            const fn = this.pendingReject;
+            this.pendingResolve = null;
+            this.pendingReject = null;
+            fn(err);
+          }
+          this.proc = null;
+          this.readyPromise = null;
+        });
       });
-    };
-    const next = this.queue.then(run, run);
-    this.queue = next.then(() => undefined, () => undefined);
-    return next;
+      return this.readyPromise;
+    }
+
+    request(payload, timeoutMs = 45_000) {
+      const run = async () => {
+        await this.ensure();
+        return await new Promise((resolve, reject) => {
+          if (!this.proc) return reject(new Error(`${this.name} not running`));
+          const timer = setTimeout(() => {
+            if (this.pendingReject) {
+              const fn = this.pendingReject;
+              this.pendingResolve = null;
+              this.pendingReject = null;
+              this.dispose();
+              fn(new Error(`${this.name} request timed out after ${timeoutMs}ms`));
+            }
+          }, timeoutMs);
+
+          this.pendingResolve = (val) => {
+            clearTimeout(timer);
+            resolve(val);
+          };
+          this.pendingReject = (err) => {
+            clearTimeout(timer);
+            reject(err);
+          };
+          try {
+            this.proc.stdin.write(JSON.stringify(payload) + "\n");
+          } catch (err) {
+            clearTimeout(timer);
+            this.pendingResolve = null;
+            this.pendingReject = null;
+            this.dispose();
+            reject(err instanceof Error ? err : new Error(String(err)));
+          }
+        });
+      };
+      const next = this.queue.then(run, run);
+      this.queue = next.then(() => undefined, () => undefined);
+      return next;
+    }
   }
-}
 
-const sttWorker = new PersistentJsonWorker("stt", STT_PYTHON, [
-  STT_WORKER,
-  process.env.CLAUDIAN_STT_MODEL || "small",
-  "auto",
-]);
-const ttsWorker = new PersistentJsonWorker("kokoro", KOKORO_PYTHON, [
-  KOKORO_WORKER,
-  KOKORO_MODEL,
-  KOKORO_VOICES,
-]);
+  const sttWorker = opts.sttWorker || new PersistentJsonWorker("stt", STT_PYTHON, [
+    STT_WORKER,
+    env.CLAUDIAN_STT_MODEL || "small",
+    "auto",
+  ]);
+  const ttsWorker = opts.ttsWorker || new PersistentJsonWorker("kokoro", KOKORO_PYTHON, [
+    KOKORO_WORKER,
+    KOKORO_MODEL,
+    KOKORO_VOICES,
+  ]);
 
-const modelCache = new Map();
-const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+  const activeChildren = new Set();
+  const modelCache = new Map();
+  const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 
-function runCliStdout(bin, args, timeoutMs = 12_000) {
-  return new Promise((resolve, reject) => {
-    execFile(bin, args, { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err);
-      resolve(stdout || "");
+  function runCliStdout(bin, args, timeoutMs = 12_000) {
+    return new Promise((resolve, reject) => {
+      execFile(bin, args, { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(err);
+        resolve(stdout || "");
+      });
     });
-  });
-}
-
-const VOICE_OUTPUT_RULES = [
-  "You are responding in a live voice call.",
-  "Structure every reply so it is effortless to follow by ear:",
-  "1) Lead with the direct answer or headline first.",
-  "2) Use short, natural spoken sentences and explicit signposts (First, Second, Next).",
-  "3) Refer to files by short name (e.g., server.mjs) instead of full directory paths, and summarize command/test results in plain speech.",
-  "4) Never output markdown tables, ASCII diagrams, raw URLs, or multi-line code blocks unless explicitly asked.",
-  "5) End with one clear next step or single decision question when input is needed.",
-].join(" ");
-
-function buildVoiceSystemPrompt(customPrompt, workspaceDir = DEFAULT_WORKSPACE) {
-  const base = String(customPrompt || "").trim() || VOICE_OUTPUT_RULES;
-  const parts = [base];
-  if (workspaceDir && workspaceDir !== DEFAULT_WORKSPACE) {
-    parts.push(
-      `[Workspace Isolation: Keep local file reads, searches, and edits scoped to ${workspaceDir} to avoid pulling unrelated context from sibling projects. Web search, web fetch, and MCP tools remain fully enabled.]`
-    );
-  }
-  return parts.join("\n\n");
-}
-
-async function listProviderModels(provider) {
-  const key = provider === "antigravity" ? "agy" : provider;
-  const cached = modelCache.get(key);
-  if (cached && Date.now() - cached.ts < MODEL_CACHE_TTL_MS) {
-    return cached.models;
   }
 
-  let models;
-  if (key === "agy") {
+  const VOICE_OUTPUT_RULES = [
+    "You are responding in a live voice call.",
+    "Structure every reply so it is effortless to follow by ear:",
+    "1) Lead with the direct answer or headline first.",
+    "2) Use short, natural spoken sentences and explicit signposts (First, Second, Next).",
+    "3) Refer to files by short name (e.g., server.mjs) instead of full directory paths, and summarize command/test results in plain speech.",
+    "4) Never output markdown tables, ASCII diagrams, raw URLs, or multi-line code blocks unless explicitly asked.",
+    "5) End with one clear next step or single decision question when input is needed.",
+  ].join(" ");
+
+  function buildVoiceSystemPrompt(customPrompt, workspaceDir = DEFAULT_WORKSPACE) {
+    const base = String(customPrompt || "").trim() || VOICE_OUTPUT_RULES;
+    const parts = [base];
+    if (workspaceDir && workspaceDir !== DEFAULT_WORKSPACE) {
+      parts.push(
+        `[Workspace Isolation: Keep local file reads, searches, and edits scoped to ${workspaceDir} to avoid pulling unrelated context from sibling projects. Web search, web fetch, and MCP tools remain fully enabled.]`
+      );
+    }
+    return parts.join("\n\n");
+  }
+
+  async function listProviderModels(provider) {
+    const key = provider === "antigravity" ? "agy" : provider;
+    const cached = modelCache.get(key);
+    if (cached && Date.now() - cached.ts < MODEL_CACHE_TTL_MS) {
+      return cached.models;
+    }
+
+    let models;
+    if (key === "agy") {
+      try {
+        const out = await runCliStdout(AGY_BIN, ["models"]);
+        const parsed = [{ id: "", label: "Default (auto)" }];
+        for (const raw of out.split("\n")) {
+          const line = raw.trim();
+          if (!line || line.startsWith("Fetching ")) continue;
+          const parts = line.split("\t");
+          if (parts.length >= 2 && parts[0].trim()) {
+            parsed.push({ id: parts[0].trim(), label: parts.slice(1).join(" ").trim() });
+          } else if (/^[a-z0-9._-]+$/i.test(line)) {
+            parsed.push({ id: line, label: line });
+          }
+        }
+        models = parsed;
+      } catch {
+        models = [{ id: "", label: "Default (auto)" }];
+      }
+    } else if (key === "opencode") {
+      try {
+        const out = await runCliStdout(OPENCODE_BIN, ["models"]);
+        const parsed = [{ id: "", label: "Default (auto)" }];
+        for (const raw of out.split("\n")) {
+          const line = raw.trim();
+          if (/^[a-z0-9._-]+\/[a-z0-9._:-]+$/i.test(line)) {
+            parsed.push({ id: line, label: line });
+          }
+        }
+        models = parsed;
+      } catch {
+        models = [{ id: "", label: "Default (auto)" }];
+      }
+    } else {
+      models = [
+        { id: "haiku", label: "Claude Haiku (Fast)" },
+        { id: "sonnet", label: "Claude Sonnet" },
+        { id: "opus", label: "Claude Opus" },
+      ];
+    }
+
+    modelCache.set(key, { ts: Date.now(), models });
+    return models;
+  }
+
+  function setCors(res) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  }
+
+  function sendJson(res, status, obj) {
+    setCors(res);
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(obj));
+  }
+
+  function readBody(req, maxBytes = 25 * 1024 * 1024) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let total = 0;
+      req.on("data", (c) => {
+        total += c.length;
+        if (total > maxBytes) {
+          req.destroy();
+          reject(new Error("Payload too large"));
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+  }
+
+  function extractFirstUserTitle(jsonlPath) {
     try {
-      const out = await runCliStdout(AGY_BIN, ["models"]);
-      const parsed = [{ id: "", label: "Default (auto)" }];
-      for (const raw of out.split("\n")) {
-        const line = raw.trim();
-        if (!line || line.startsWith("Fetching ")) continue;
-        const parts = line.split("\t");
-        if (parts.length >= 2 && parts[0].trim()) {
-          parsed.push({ id: parts[0].trim(), label: parts.slice(1).join(" ").trim() });
-        } else if (/^[a-z0-9._-]+$/i.test(line)) {
-          parsed.push({ id: line, label: line });
+      const fd = fs.openSync(jsonlPath, "r");
+      const buf = Buffer.alloc(65536);
+      const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      const lines = buf.toString("utf8", 0, bytes).split("\n");
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === "user" && ev.message?.content) {
+            const text = Array.isArray(ev.message.content)
+              ? ev.message.content
+                  .filter((b) => b.type === "text")
+                  .map((b) => b.text)
+                  .join(" ")
+              : String(ev.message.content);
+            const cleaned = text.replace(/\s+/g, " ").trim();
+            if (cleaned) return cleaned.slice(0, 60);
+          }
+        } catch {
+          // skip partial/malformed line
         }
       }
-      models = parsed;
     } catch {
-      models = [{ id: "", label: "Default (auto)" }];
+      // ignore
     }
-  } else if (key === "opencode") {
-    try {
-      const out = await runCliStdout(OPENCODE_BIN, ["models"]);
-      const parsed = [{ id: "", label: "Default (auto)" }];
-      for (const raw of out.split("\n")) {
-        const line = raw.trim();
-        if (/^[a-z0-9._-]+\/[a-z0-9._:-]+$/i.test(line)) {
-          parsed.push({ id: line, label: line });
-        }
-      }
-      models = parsed;
-    } catch {
-      models = [{ id: "", label: "Default (auto)" }];
-    }
-  } else {
-    models = [
-      { id: "haiku", label: "Claude Haiku (Fast)" },
-      { id: "sonnet", label: "Claude Sonnet" },
-      { id: "opus", label: "Claude Opus" },
-    ];
+    return "Conversation";
   }
 
-  modelCache.set(key, { ts: Date.now(), models });
-  return models;
-}
+  const SESSIONS_INDEX_PATH = path.join(CONFIG_DIR, "sessions.json");
+  const SESSIONS_HISTORY_DIR = path.join(CONFIG_DIR, "history");
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-}
+  function readBridgeSessionsIndex() {
+    try {
+      if (!fs.existsSync(SESSIONS_INDEX_PATH)) return {};
+      return JSON.parse(fs.readFileSync(SESSIONS_INDEX_PATH, "utf8")) || {};
+    } catch {
+      return {};
+    }
+  }
 
-function sendJson(res, status, obj) {
-  setCors(res);
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(obj));
-}
+  function recordBridgeTurn({ sessionId, cwd, provider, model, userText, assistantText }) {
+    if (!sessionId || !/^[a-zA-Z0-9._:-]+$/.test(sessionId)) return;
+    try {
+      fs.mkdirSync(SESSIONS_HISTORY_DIR, { recursive: true });
+      const index = readBridgeSessionsIndex();
+      const existing = index[sessionId];
+      const cleanTitle = (userText || "").replace(/\s+/g, " ").trim().slice(0, 60) || "Conversation";
+      index[sessionId] = {
+        id: sessionId,
+        sessionId,
+        title: existing?.title || cleanTitle,
+        cwd: cwd || existing?.cwd || VAULT_DIR,
+        provider: provider || existing?.provider || "claude",
+        selectedModel: model || existing?.selectedModel || provider || "claude",
+        lastActivityAt: Date.now(),
+      };
+      const tmpIdx = `${SESSIONS_INDEX_PATH}.tmp`;
+      fs.writeFileSync(tmpIdx, JSON.stringify(index, null, 2));
+      fs.renameSync(tmpIdx, SESSIONS_INDEX_PATH);
 
-function readBody(req, maxBytes = 25 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on("data", (c) => {
-      total += c.length;
-      if (total > maxBytes) {
-        req.destroy();
-        reject(new Error("Payload too large"));
-        return;
+      const safeFile = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const histPath = path.join(SESSIONS_HISTORY_DIR, `${safeFile}.json`);
+      let msgs = [];
+      if (fs.existsSync(histPath)) {
+        try {
+          msgs = JSON.parse(fs.readFileSync(histPath, "utf8")) || [];
+        } catch {
+          msgs = [];
+        }
       }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
+      if (userText) msgs.push({ role: "user", text: userText });
+      if (assistantText) msgs.push({ role: "assistant", text: assistantText });
+      const tmpHist = `${histPath}.tmp`;
+      fs.writeFileSync(tmpHist, JSON.stringify(msgs));
+      fs.renameSync(tmpHist, histPath);
+    } catch {
+      // non-fatal
+    }
+  }
 
-function extractFirstUserTitle(jsonlPath) {
-  try {
-    const fd = fs.openSync(jsonlPath, "r");
-    const buf = Buffer.alloc(65536);
-    const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
-    const lines = buf.toString("utf8", 0, bytes).split("\n");
+  function listClaudianSessions(requestedWorkspace = "") {
+    const targetDir =
+      requestedWorkspace &&
+      fs.existsSync(requestedWorkspace) &&
+      fs.statSync(requestedWorkspace).isDirectory()
+        ? requestedWorkspace
+        : VAULT_DIR;
+    const bySessionId = new Map();
+
+    const index = readBridgeSessionsIndex();
+    for (const item of Object.values(index)) {
+      if (!item?.sessionId) continue;
+      if (item.cwd && path.resolve(item.cwd) !== path.resolve(targetDir)) continue;
+      bySessionId.set(item.sessionId, {
+        id: item.id || item.sessionId,
+        title: item.title || "Conversation",
+        sessionId: item.sessionId,
+        selectedModel: item.selectedModel || item.provider || "claude",
+        lastActivityAt: item.lastActivityAt || 0,
+      });
+    }
+
+    const sessionsRoot = path.join(targetDir, ".claudian", "sessions");
+    if (fs.existsSync(sessionsRoot)) {
+      const walk = (dir) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (entry.name.endsWith(".meta.json")) {
+            try {
+              const meta = JSON.parse(fs.readFileSync(full, "utf8"));
+              const sid = meta.sessionId || meta.providerState?.providerSessionId;
+              if (!sid) continue;
+              bySessionId.set(sid, {
+                id: meta.id || sid,
+                title: meta.title || "Untitled",
+                sessionId: sid,
+                selectedModel: meta.selectedModel || "haiku",
+                lastActivityAt: meta.lastActivityAt || meta.createdAt || 0,
+              });
+            } catch {
+              // skip corrupt
+            }
+          }
+        }
+      };
+      walk(sessionsRoot);
+    }
+
+    const slug = targetDir.replace(/[/_]/g, "-");
+    const claudeDir = path.join(homeDir, ".claude", "projects", slug);
+    if (fs.existsSync(claudeDir)) {
+      const jsonls = fs
+        .readdirSync(claudeDir)
+        .filter((f) => f.endsWith(".jsonl") && !f.startsWith("agent-"))
+        .map((f) => {
+          const full = path.join(claudeDir, f);
+          const st = fs.statSync(full);
+          return { sid: f.slice(0, -6), full, mtimeMs: st.mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(0, 30);
+
+      for (const item of jsonls) {
+        const existing = bySessionId.get(item.sid);
+        if (existing) {
+          existing.lastActivityAt = Math.max(existing.lastActivityAt, item.mtimeMs);
+        } else {
+          bySessionId.set(item.sid, {
+            id: item.sid,
+            title: extractFirstUserTitle(item.full),
+            sessionId: item.sid,
+            selectedModel: "claude",
+            lastActivityAt: item.mtimeMs,
+          });
+        }
+      }
+    }
+
+    return Array.from(bySessionId.values())
+      .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+      .slice(0, 30);
+  }
+
+  function readSessionMessages(sessionId) {
+    if (!sessionId || !/^[a-zA-Z0-9._:-]+$/.test(sessionId)) return [];
+    const safeFile = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const histPath = path.join(SESSIONS_HISTORY_DIR, `${safeFile}.json`);
+    if (fs.existsSync(histPath)) {
+      try {
+        const msgs = JSON.parse(fs.readFileSync(histPath, "utf8"));
+        if (Array.isArray(msgs) && msgs.length > 0) return msgs;
+      } catch {
+        // fall through to Claude jsonl
+      }
+    }
+    const projectsRoot = path.join(homeDir, ".claude", "projects");
+    const slug = VAULT_DIR.replace(/[/_]/g, "-");
+    let jsonlPath = path.join(projectsRoot, slug, `${sessionId}.jsonl`);
+    if (!fs.existsSync(jsonlPath) && fs.existsSync(projectsRoot)) {
+      for (const entry of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const candidate = path.join(projectsRoot, entry.name, `${sessionId}.jsonl`);
+        if (fs.existsSync(candidate)) {
+          jsonlPath = candidate;
+          break;
+        }
+      }
+    }
+    if (!fs.existsSync(jsonlPath)) return [];
+
+    const lines = fs.readFileSync(jsonlPath, "utf8").split("\n");
+    const messages = [];
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const ev = JSON.parse(line);
         if (ev.type === "user" && ev.message?.content) {
-          const text = Array.isArray(ev.message.content)
+          const content = Array.isArray(ev.message.content)
             ? ev.message.content
                 .filter((b) => b.type === "text")
                 .map((b) => b.text)
-                .join(" ")
+                .join("\n")
             : String(ev.message.content);
-          const cleaned = text.replace(/\s+/g, " ").trim();
-          if (cleaned) return cleaned.slice(0, 60);
-        }
-      } catch {
-        // skip partial/malformed line
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return "Conversation";
-}
-
-const SESSIONS_INDEX_PATH = path.join(CONFIG_DIR, "sessions.json");
-const SESSIONS_HISTORY_DIR = path.join(CONFIG_DIR, "history");
-
-function readBridgeSessionsIndex() {
-  try {
-    if (!fs.existsSync(SESSIONS_INDEX_PATH)) return {};
-    return JSON.parse(fs.readFileSync(SESSIONS_INDEX_PATH, "utf8")) || {};
-  } catch {
-    return {};
-  }
-}
-
-function recordBridgeTurn({ sessionId, cwd, provider, model, userText, assistantText }) {
-  if (!sessionId || !/^[a-zA-Z0-9._:-]+$/.test(sessionId)) return;
-  try {
-    fs.mkdirSync(SESSIONS_HISTORY_DIR, { recursive: true });
-    const index = readBridgeSessionsIndex();
-    const existing = index[sessionId];
-    const cleanTitle = (userText || "").replace(/\s+/g, " ").trim().slice(0, 60) || "Conversation";
-    index[sessionId] = {
-      id: sessionId,
-      sessionId,
-      title: existing?.title || cleanTitle,
-      cwd: cwd || existing?.cwd || VAULT_DIR,
-      provider: provider || existing?.provider || "claude",
-      selectedModel: model || existing?.selectedModel || provider || "claude",
-      lastActivityAt: Date.now(),
-    };
-    const tmpIdx = `${SESSIONS_INDEX_PATH}.tmp`;
-    fs.writeFileSync(tmpIdx, JSON.stringify(index, null, 2));
-    fs.renameSync(tmpIdx, SESSIONS_INDEX_PATH);
-
-    const safeFile = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const histPath = path.join(SESSIONS_HISTORY_DIR, `${safeFile}.json`);
-    let msgs = [];
-    if (fs.existsSync(histPath)) {
-      try {
-        msgs = JSON.parse(fs.readFileSync(histPath, "utf8")) || [];
-      } catch {
-        msgs = [];
-      }
-    }
-    if (userText) msgs.push({ role: "user", text: userText });
-    if (assistantText) msgs.push({ role: "assistant", text: assistantText });
-    const tmpHist = `${histPath}.tmp`;
-    fs.writeFileSync(tmpHist, JSON.stringify(msgs));
-    fs.renameSync(tmpHist, histPath);
-  } catch {
-    // non-fatal
-  }
-}
-
-function listClaudianSessions(requestedWorkspace = "") {
-  const targetDir =
-    requestedWorkspace &&
-    fs.existsSync(requestedWorkspace) &&
-    fs.statSync(requestedWorkspace).isDirectory()
-      ? requestedWorkspace
-      : VAULT_DIR;
-  const bySessionId = new Map();
-
-  const index = readBridgeSessionsIndex();
-  for (const item of Object.values(index)) {
-    if (!item?.sessionId) continue;
-    if (item.cwd && path.resolve(item.cwd) !== path.resolve(targetDir)) continue;
-    bySessionId.set(item.sessionId, {
-      id: item.id || item.sessionId,
-      title: item.title || "Conversation",
-      sessionId: item.sessionId,
-      selectedModel: item.selectedModel || item.provider || "claude",
-      lastActivityAt: item.lastActivityAt || 0,
-    });
-  }
-
-  const sessionsRoot = path.join(targetDir, ".claudian", "sessions");
-  if (fs.existsSync(sessionsRoot)) {
-    const walk = (dir) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) walk(full);
-        else if (entry.name.endsWith(".meta.json")) {
-          try {
-            const meta = JSON.parse(fs.readFileSync(full, "utf8"));
-            const sid = meta.sessionId || meta.providerState?.providerSessionId;
-            if (!sid) continue;
-            bySessionId.set(sid, {
-              id: meta.id || sid,
-              title: meta.title || "Untitled",
-              sessionId: sid,
-              selectedModel: meta.selectedModel || "haiku",
-              lastActivityAt: meta.lastActivityAt || meta.createdAt || 0,
-            });
-          } catch {
-            // skip corrupt
+          if (content.trim()) {
+            messages.push({ role: "user", text: content.trim() });
+          }
+        } else if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
+          const text = ev.message.content
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join("\n")
+            .trim();
+          if (text) {
+            messages.push({ role: "assistant", text });
           }
         }
-      }
-    };
-    walk(sessionsRoot);
-  }
-
-  const slug = targetDir.replace(/[/_]/g, "-");
-  const claudeDir = path.join(os.homedir(), ".claude", "projects", slug);
-  if (fs.existsSync(claudeDir)) {
-    const jsonls = fs
-      .readdirSync(claudeDir)
-      .filter((f) => f.endsWith(".jsonl") && !f.startsWith("agent-"))
-      .map((f) => {
-        const full = path.join(claudeDir, f);
-        const st = fs.statSync(full);
-        return { sid: f.slice(0, -6), full, mtimeMs: st.mtimeMs };
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, 30);
-
-    for (const item of jsonls) {
-      const existing = bySessionId.get(item.sid);
-      if (existing) {
-        existing.lastActivityAt = Math.max(existing.lastActivityAt, item.mtimeMs);
-      } else {
-        bySessionId.set(item.sid, {
-          id: item.sid,
-          title: extractFirstUserTitle(item.full),
-          sessionId: item.sid,
-          selectedModel: "claude",
-          lastActivityAt: item.mtimeMs,
-        });
+      } catch {
+        // skip malformed line
       }
     }
+    return messages;
   }
 
-  return Array.from(bySessionId.values())
-    .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
-    .slice(0, 30);
-}
-
-function readSessionMessages(sessionId) {
-  if (!sessionId || !/^[a-zA-Z0-9._:-]+$/.test(sessionId)) return [];
-  const safeFile = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const histPath = path.join(SESSIONS_HISTORY_DIR, `${safeFile}.json`);
-  if (fs.existsSync(histPath)) {
-    try {
-      const msgs = JSON.parse(fs.readFileSync(histPath, "utf8"));
-      if (Array.isArray(msgs) && msgs.length > 0) return msgs;
-    } catch {
-      // fall through to Claude jsonl
-    }
-  }
-  const projectsRoot = path.join(os.homedir(), ".claude", "projects");
-  const slug = VAULT_DIR.replace(/[/_]/g, "-");
-  let jsonlPath = path.join(projectsRoot, slug, `${sessionId}.jsonl`);
-  if (!fs.existsSync(jsonlPath) && fs.existsSync(projectsRoot)) {
-    for (const entry of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const candidate = path.join(projectsRoot, entry.name, `${sessionId}.jsonl`);
-      if (fs.existsSync(candidate)) {
-        jsonlPath = candidate;
-        break;
-      }
-    }
-  }
-  if (!fs.existsSync(jsonlPath)) return [];
-
-  const lines = fs.readFileSync(jsonlPath, "utf8").split("\n");
-  const messages = [];
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const ev = JSON.parse(line);
-      if (ev.type === "user" && ev.message?.content) {
-        const content = Array.isArray(ev.message.content)
-          ? ev.message.content
-              .filter((b) => b.type === "text")
-              .map((b) => b.text)
-              .join("\n")
-          : String(ev.message.content);
-        if (content.trim()) {
-          messages.push({ role: "user", text: content.trim() });
-        }
-      } else if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
-        const text = ev.message.content
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join("\n")
-          .trim();
-        if (text) {
-          messages.push({ role: "assistant", text });
-        }
-      }
-    } catch {
-      // skip malformed line
-    }
-  }
-  return messages;
-}
-
-const server = http.createServer(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    sendJson(res, 200, {
-      ok: true,
-      vault: VAULT_DIR,
-      claude: fs.existsSync(CLAUDE_BIN),
-      agy: fs.existsSync(AGY_BIN),
-      opencode: fs.existsSync(OPENCODE_BIN),
-      stt: fs.existsSync(STT_WORKER),
-      tts: fs.existsSync(KOKORO_WORKER),
-    });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/apk/version") {
-    const { apkPath, metaPath } = resolveApkPaths();
-    if (!fs.existsSync(apkPath)) {
-      sendJson(res, 404, { error: "APK not built yet" });
-      return;
-    }
-    let versionCode = 1;
-    let versionName = "0.1.0";
-    try {
-      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-      const el = meta.elements?.[0];
-      if (el?.versionCode) versionCode = Number(el.versionCode);
-      if (el?.versionName) versionName = String(el.versionName);
-    } catch {
-      // use defaults
-    }
-    const stat = fs.statSync(apkPath);
-    sendJson(res, 200, {
-      ok: true,
-      versionCode,
-      versionName,
-      size: stat.size,
-      mtimeMs: Math.round(stat.mtimeMs),
-    });
-    return;
-  }
-
-  if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/apk") {
-    const { apkPath } = resolveApkPaths();
-    if (!fs.existsSync(apkPath)) {
-      sendJson(res, 404, { error: "APK not built yet" });
-      return;
-    }
-    const stat = fs.statSync(apkPath);
-    res.writeHead(200, {
-      "Content-Type": "application/vnd.android.package-archive",
-      "Content-Disposition": 'attachment; filename="claudian-call.apk"',
-      "Content-Length": stat.size,
-    });
-    if (req.method === "HEAD") {
+  const server = http.createServer(async (req, res) => {
+    setCors(res);
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
       res.end();
       return;
     }
-    fs.createReadStream(apkPath).pipe(res);
-    return;
-  }
 
-  const auth = req.headers.authorization || "";
-  if (auth !== `Bearer ${AUTH_TOKEN}`) {
-    sendJson(res, 401, { error: "Unauthorized" });
-    return;
-  }
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-  if (req.method === "GET" && url.pathname === "/workspaces") {
-    const out = [{ path: DEFAULT_WORKSPACE, name: `${path.basename(DEFAULT_WORKSPACE) || DEFAULT_WORKSPACE} (default)` }];
-    try {
-      for (const entry of fs.readdirSync(WORKSPACES_ROOT, { withFileTypes: true })) {
-        if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-        const full = path.join(WORKSPACES_ROOT, entry.name);
-        if (full !== DEFAULT_WORKSPACE) {
-          out.push({ path: full, name: entry.name });
-        }
-      }
-    } catch {
-      // ignore unreadable root
-    }
-    sendJson(res, 200, { ok: true, defaultWorkspace: DEFAULT_WORKSPACE, workspaces: out });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/workspaces") {
-    try {
-      const body = JSON.parse((await readBody(req)).toString("utf8"));
-      const rawName = String(body.name || "").trim();
-      const safeName = rawName.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-      if (!safeName || safeName === "." || safeName === ".." || safeName.startsWith(".")) {
-        sendJson(res, 400, { ok: false, error: "Invalid folder name" });
-        return;
-      }
-      const targetPath = path.join(WORKSPACES_ROOT, safeName);
-      fs.mkdirSync(targetPath, { recursive: true });
-      sendJson(res, 200, { ok: true, workspace: { path: targetPath, name: safeName } });
-    } catch (err) {
-      sendJson(res, 400, { ok: false, error: err.message });
-    }
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/models") {
-    const provider = String(url.searchParams.get("provider") || "claude").toLowerCase();
-    try {
-      const models = await listProviderModels(provider);
-      sendJson(res, 200, { ok: true, provider, models });
-    } catch (err) {
-      sendJson(res, 500, { ok: false, provider, models: [], error: err.message });
-    }
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/sessions") {
-    const cwd = url.searchParams.get("cwd") || "";
-    sendJson(res, 200, { sessions: listClaudianSessions(cwd) });
-    return;
-  }
-
-  const msgMatch = url.pathname.match(/^\/sessions\/([a-zA-Z0-9._:-]+)\/messages$/);
-  if (req.method === "GET" && msgMatch) {
-    sendJson(res, 200, { messages: readSessionMessages(msgMatch[1]) });
-    return;
-  }
-
-  const recapMatch = url.pathname.match(/^\/sessions\/([a-zA-Z0-9._:-]+)\/recap$/);
-  if (req.method === "POST" && recapMatch) {
-    try {
-      const msgs = readSessionMessages(recapMatch[1]);
-      if (msgs.length === 0) {
-        sendJson(res, 200, { ok: true, recap: "This conversation has no messages yet." });
-        return;
-      }
-      const recent = msgs
-        .slice(-14)
-        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.text || "").slice(0, 500)}`)
-        .join("\n");
-      const recapPrompt = [
-        "Summarize this conversation for a 5-second spoken catch-up.",
-        "Return 3 short, natural spoken sentences (no markdown, no bullets, no file paths):",
-        "1) What we were working on, 2) Key progress or decision made, 3) Suggested next step.",
-        "",
-        recent,
-      ].join("\n");
-      const out = await new Promise((resolve, reject) => {
-        const child = spawn(CLAUDE_BIN, ["-p", recapPrompt, "--model", "haiku", "--output-format", "text"], {
-          env: process.env,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let stdout = "";
-        const timer = setTimeout(() => {
-          try { child.kill("SIGTERM"); } catch {}
-          reject(new Error("Recap timed out"));
-        }, 25_000);
-        child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          if (code === 0 && stdout.trim()) resolve(stdout.trim());
-          else reject(new Error(`Recap exited ${code}`));
-        });
-        child.on("error", (e) => { clearTimeout(timer); reject(e); });
+    if (req.method === "GET" && url.pathname === "/health") {
+      sendJson(res, 200, {
+        ok: true,
+        vault: VAULT_DIR,
+        claude: fs.existsSync(CLAUDE_BIN),
+        agy: fs.existsSync(AGY_BIN),
+        opencode: fs.existsSync(OPENCODE_BIN),
+        stt: fs.existsSync(STT_WORKER),
+        tts: fs.existsSync(KOKORO_WORKER),
       });
-      sendJson(res, 200, { ok: true, recap: out });
-    } catch (err) {
-      const msgs = readSessionMessages(recapMatch[1]);
-      const lastUser = [...msgs].reverse().find((m) => m.role === "user")?.text || "";
-      const lastAsst = [...msgs].reverse().find((m) => m.role === "assistant")?.text || "";
-      const fallback = `Last topic: ${lastUser.slice(0, 120)}. Latest reply: ${lastAsst.slice(0, 140)}.`;
-      sendJson(res, 200, { ok: true, recap: fallback, fallback: true });
+      return;
     }
-    return;
-  }
 
-  if (req.method === "POST" && url.pathname === "/vault/save") {
-    try {
-      const body = JSON.parse((await readBody(req)).toString("utf8"));
-      const rawTitle = String(body.title || "Voice Note").trim();
-      const content = String(body.content || "").trim();
-      if (!content) {
-        sendJson(res, 400, { ok: false, error: "Empty content" });
+    if (req.method === "GET" && url.pathname === "/apk/version") {
+      const { apkPath, metaPath } = resolveApkPaths();
+      if (!fs.existsSync(apkPath)) {
+        sendJson(res, 404, { error: "APK not built yet" });
         return;
       }
-      const dateStr = new Date().toISOString().slice(0, 10);
-      const slug = rawTitle
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 48) || "note";
-      const notesDir = path.join(OBSIDIAN_VAULT_DIR, "Voice Notes");
-      fs.mkdirSync(notesDir, { recursive: true });
-      const timeSuffix = new Date().toISOString().slice(11, 19).replace(/:/g, "");
-      const fileName = `${dateStr} - ${slug}-${timeSuffix}.md`;
-      const fullPath = path.join(notesDir, fileName);
-      const workspaceName = body.workspace ? path.basename(String(body.workspace)) : "";
-      const md = [
-        "---",
-        `date: ${new Date().toISOString()}`,
-        "source: claudian-call",
-        workspaceName ? `workspace: ${workspaceName}` : null,
-        body.sessionId ? `session_id: ${String(body.sessionId)}` : null,
-        "---",
-        "",
-        `# ${rawTitle}`,
-        "",
-        content,
-        "",
-      ]
-        .filter((l) => l !== null)
-        .join("\n");
-      fs.writeFileSync(fullPath, md, "utf8");
-      sendJson(res, 200, { ok: true, path: fullPath, relativePath: `Voice Notes/${fileName}` });
-    } catch (err) {
-      sendJson(res, 500, { ok: false, error: err.message });
-    }
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/stt") {
-    try {
-      const body = await readBody(req);
-      let wavBuf = body;
-      let language = url.searchParams.get("language") || "en";
-      const ct = req.headers["content-type"] || "";
-      if (ct.includes("application/json")) {
-        const parsed = JSON.parse(body.toString("utf8"));
-        wavBuf = Buffer.from(parsed.wavBase64, "base64");
-        language = parsed.language || language;
-      }
-      const tmpWav = path.join(os.tmpdir(), `bridge-stt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
-      fs.writeFileSync(tmpWav, wavBuf);
+      let versionCode = 1;
+      let versionName = "0.1.0";
       try {
-        const result = await sttWorker.request({ wav: tmpWav, language });
-        sendJson(res, 200, result);
-      } finally {
-        fs.unlink(tmpWav, () => {});
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+        const el = meta.elements?.[0];
+        if (el?.versionCode) versionCode = Number(el.versionCode);
+        if (el?.versionName) versionName = String(el.versionName);
+      } catch {
+        // use defaults
       }
-    } catch (err) {
-      sendJson(res, 500, { ok: false, error: err.message });
+      const stat = fs.statSync(apkPath);
+      sendJson(res, 200, {
+        ok: true,
+        versionCode,
+        versionName,
+        size: stat.size,
+        mtimeMs: Math.round(stat.mtimeMs),
+      });
+      return;
     }
-    return;
-  }
 
-  if (req.method === "POST" && url.pathname === "/tts") {
-    try {
-      const body = JSON.parse((await readBody(req)).toString("utf8"));
-      const tmpWav = path.join(os.tmpdir(), `bridge-tts-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/apk") {
+      const { apkPath } = resolveApkPaths();
+      if (!fs.existsSync(apkPath)) {
+        sendJson(res, 404, { error: "APK not built yet" });
+        return;
+      }
+      const stat = fs.statSync(apkPath);
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.android.package-archive",
+        "Content-Disposition": 'attachment; filename="claudian-call.apk"',
+        "Content-Length": stat.size,
+      });
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      fs.createReadStream(apkPath).pipe(res);
+      return;
+    }
+
+    const auth = req.headers.authorization || "";
+    if (auth !== `Bearer ${AUTH_TOKEN}`) {
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/workspaces") {
+      const out = [{ path: DEFAULT_WORKSPACE, name: `${path.basename(DEFAULT_WORKSPACE) || DEFAULT_WORKSPACE} (default)` }];
       try {
-        const result = await ttsWorker.request({
-          text: body.text || "",
-          voice: body.voice || "af_heart",
-          speed: Number(body.speed || 1.05),
-          out_wav: tmpWav,
-        });
-        if (!result.ok) {
-          sendJson(res, 500, result);
+        for (const entry of fs.readdirSync(WORKSPACES_ROOT, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+          const full = path.join(WORKSPACES_ROOT, entry.name);
+          if (full !== DEFAULT_WORKSPACE) {
+            out.push({ path: full, name: entry.name });
+          }
+        }
+      } catch {
+        // ignore unreadable root
+      }
+      sendJson(res, 200, { ok: true, defaultWorkspace: DEFAULT_WORKSPACE, workspaces: out });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/workspaces") {
+      try {
+        const body = JSON.parse((await readBody(req)).toString("utf8"));
+        const rawName = String(body.name || "").trim();
+        const safeName = rawName.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+        if (!safeName || safeName === "." || safeName === ".." || safeName.startsWith(".")) {
+          sendJson(res, 400, { ok: false, error: "Invalid folder name" });
           return;
         }
-        const wav = fs.readFileSync(tmpWav);
-        setCors(res);
-        res.writeHead(200, {
-          "Content-Type": "audio/wav",
-          "Content-Length": wav.length,
-        });
-        res.end(wav);
-      } finally {
-        fs.unlink(tmpWav, () => {});
+        const targetPath = path.join(WORKSPACES_ROOT, safeName);
+        fs.mkdirSync(targetPath, { recursive: true });
+        sendJson(res, 200, { ok: true, workspace: { path: targetPath, name: safeName } });
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: err.message });
       }
-    } catch (err) {
-      sendJson(res, 500, { ok: false, error: err.message });
-    }
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/chat") {
-    let body;
-    try {
-      body = JSON.parse((await readBody(req)).toString("utf8"));
-    } catch (err) {
-      sendJson(res, 400, { error: "Invalid JSON" });
       return;
     }
 
-    const prompt = String(body.prompt || "").trim();
-    if (!prompt) {
-      sendJson(res, 400, { error: "Missing prompt" });
-      return;
-    }
-
-    setCors(res);
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-
-    const writeEvent = (event, data) => {
-      if (!res.writableEnded) {
-        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      }
-    };
-
-    const keepaliveTimer = setInterval(() => {
-      if (!res.writableEnded) {
-        try {
-          res.write(": keepalive\n\n");
-        } catch {
-          // ignore
-        }
-      }
-    }, 15_000);
-    req.on("close", () => clearInterval(keepaliveTimer));
-    res.on("finish", () => clearInterval(keepaliveTimer));
-
-    const requestedCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
-    const workspaceDir =
-      requestedCwd && fs.existsSync(requestedCwd) && fs.statSync(requestedCwd).isDirectory()
-        ? requestedCwd
-        : DEFAULT_WORKSPACE;
-    const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
-
-    const provider = String(body.provider || "claude").toLowerCase();
-    const finalSystemPrompt = buildVoiceSystemPrompt(body.systemPrompt, workspaceDir);
-    const effectivePrompt =
-      provider !== "claude" && finalSystemPrompt
-        ? `[Instructions: ${finalSystemPrompt}]\n\n${prompt}`
-        : prompt;
-
-    let bin = CLAUDE_BIN;
-    let args;
-    if (provider === "agy" || provider === "antigravity") {
-      bin = AGY_BIN;
-      args = [
-        "-p",
-        effectivePrompt,
-        "--output-format",
-        "stream-json",
-        "--mode",
-        "auto",
-      ];
-      if (body.sessionId) args.push("--conversation", String(body.sessionId));
-      if (body.model) args.push("--model", String(body.model));
-    } else if (provider === "opencode") {
-      bin = OPENCODE_BIN;
-      args = ["run", effectivePrompt, "--format", "json", "--auto"];
-      if (body.sessionId) args.push("-s", String(body.sessionId));
-      if (body.model) args.push("-m", String(body.model));
-    } else {
-      bin = CLAUDE_BIN;
-      args = [
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--include-partial-messages",
-        "--verbose",
-        "--permission-mode",
-        "auto",
-      ];
-      if (body.sessionId) args.push("--resume", String(body.sessionId));
-      if (body.model) args.push("--model", String(body.model));
-      if (finalSystemPrompt) {
-        args.push("--append-system-prompt", finalSystemPrompt);
-      }
-    }
-
-    const child = spawn(bin, args, {
-      cwd: workspaceDir,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let buf = "";
-    let fullText = "";
-    let activeSessionId = body.sessionId || null;
-    let doneSent = false;
-
-    const sendDone = () => {
-      if (doneSent) return;
-      doneSent = true;
-      if (activeSessionId) {
-        recordBridgeTurn({
-          sessionId: activeSessionId,
-          cwd: workspaceDir,
-          provider,
-          model: body.model || provider,
-          userText: prompt,
-          assistantText: fullText,
-        });
-      }
-      writeEvent("done", { sessionId: activeSessionId, text: fullText });
-    };
-
-    const killChildGracefully = () => {
-      if (child.killed) return;
+    if (req.method === "GET" && url.pathname === "/models") {
+      const provider = String(url.searchParams.get("provider") || "claude").toLowerCase();
       try {
-        child.kill("SIGTERM");
-      } catch {
+        const models = await listProviderModels(provider);
+        sendJson(res, 200, { ok: true, provider, models });
+      } catch (err) {
+        sendJson(res, 500, { ok: false, provider, models: [], error: err.message });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/sessions") {
+      const cwd = url.searchParams.get("cwd") || "";
+      sendJson(res, 200, { sessions: listClaudianSessions(cwd) });
+      return;
+    }
+
+    const msgMatch = url.pathname.match(/^\/sessions\/([a-zA-Z0-9._:-]+)\/messages$/);
+    if (req.method === "GET" && msgMatch) {
+      sendJson(res, 200, { messages: readSessionMessages(msgMatch[1]) });
+      return;
+    }
+
+    const recapMatch = url.pathname.match(/^\/sessions\/([a-zA-Z0-9._:-]+)\/recap$/);
+    if (req.method === "POST" && recapMatch) {
+      try {
+        const msgs = readSessionMessages(recapMatch[1]);
+        if (msgs.length === 0) {
+          sendJson(res, 200, { ok: true, recap: "This conversation has no messages yet." });
+          return;
+        }
+        const recent = msgs
+          .slice(-14)
+          .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.text || "").slice(0, 500)}`)
+          .join("\n");
+        const recapPrompt = [
+          "Summarize this conversation for a 5-second spoken catch-up.",
+          "Return 3 short, natural spoken sentences (no markdown, no bullets, no file paths):",
+          "1) What we were working on, 2) Key progress or decision made, 3) Suggested next step.",
+          "",
+          recent,
+        ].join("\n");
+        const out = await new Promise((resolve, reject) => {
+          const child = spawn(CLAUDE_BIN, ["-p", recapPrompt, "--model", "haiku", "--output-format", "text"], {
+            env,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          let stdout = "";
+          const timer = setTimeout(() => {
+            try { child.kill("SIGTERM"); } catch {}
+            reject(new Error("Recap timed out"));
+          }, 25_000);
+          child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            if (code === 0 && stdout.trim()) resolve(stdout.trim());
+            else reject(new Error(`Recap exited ${code}`));
+          });
+          child.on("error", (e) => { clearTimeout(timer); reject(e); });
+        });
+        sendJson(res, 200, { ok: true, recap: out });
+      } catch (err) {
+        const msgs = readSessionMessages(recapMatch[1]);
+        const lastUser = [...msgs].reverse().find((m) => m.role === "user")?.text || "";
+        const lastAsst = [...msgs].reverse().find((m) => m.role === "assistant")?.text || "";
+        const fallback = `Last topic: ${lastUser.slice(0, 120)}. Latest reply: ${lastAsst.slice(0, 140)}.`;
+        sendJson(res, 200, { ok: true, recap: fallback, fallback: true });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/vault/save") {
+      try {
+        const body = JSON.parse((await readBody(req)).toString("utf8"));
+        const rawTitle = String(body.title || "Voice Note").trim();
+        const content = String(body.content || "").trim();
+        if (!content) {
+          sendJson(res, 400, { ok: false, error: "Empty content" });
+          return;
+        }
+        const dateStr = new Date().toISOString().slice(0, 10);
+        const slug = rawTitle
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 48) || "note";
+        const notesDir = path.join(OBSIDIAN_VAULT_DIR, "Voice Notes");
+        fs.mkdirSync(notesDir, { recursive: true });
+        const timeSuffix = new Date().toISOString().slice(11, 19).replace(/:/g, "");
+        const fileName = `${dateStr} - ${slug}-${timeSuffix}.md`;
+        const fullPath = path.join(notesDir, fileName);
+        const workspaceName = body.workspace ? path.basename(String(body.workspace)) : "";
+        const md = [
+          "---",
+          `date: ${new Date().toISOString()}`,
+          "source: claudian-call",
+          workspaceName ? `workspace: ${workspaceName}` : null,
+          body.sessionId ? `session_id: ${String(body.sessionId)}` : null,
+          "---",
+          "",
+          `# ${rawTitle}`,
+          "",
+          content,
+          "",
+        ]
+          .filter((l) => l !== null)
+          .join("\n");
+        fs.writeFileSync(fullPath, md, "utf8");
+        sendJson(res, 200, { ok: true, path: fullPath, relativePath: `Voice Notes/${fileName}` });
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: err.message });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/stt") {
+      try {
+        const body = await readBody(req);
+        let wavBuf = body;
+        let language = url.searchParams.get("language") || "en";
+        const ct = req.headers["content-type"] || "";
+        if (ct.includes("application/json")) {
+          const parsed = JSON.parse(body.toString("utf8"));
+          wavBuf = Buffer.from(parsed.wavBase64, "base64");
+          language = parsed.language || language;
+        }
+        const tmpWav = path.join(os.tmpdir(), `bridge-stt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
+        fs.writeFileSync(tmpWav, wavBuf);
+        try {
+          const result = await sttWorker.request({ wav: tmpWav, language });
+          sendJson(res, 200, result);
+        } finally {
+          fs.unlink(tmpWav, () => {});
+        }
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: err.message });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/tts") {
+      try {
+        const body = JSON.parse((await readBody(req)).toString("utf8"));
+        const tmpWav = path.join(os.tmpdir(), `bridge-tts-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.wav`);
+        try {
+          const result = await ttsWorker.request({
+            text: body.text || "",
+            voice: body.voice || "af_heart",
+            speed: Number(body.speed || 1.05),
+            out_wav: tmpWav,
+          });
+          if (!result.ok) {
+            sendJson(res, 500, result);
+            return;
+          }
+          const wav = fs.readFileSync(tmpWav);
+          setCors(res);
+          res.writeHead(200, {
+            "Content-Type": "audio/wav",
+            "Content-Length": wav.length,
+          });
+          res.end(wav);
+        } finally {
+          fs.unlink(tmpWav, () => {});
+        }
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: err.message });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/chat") {
+      let body;
+      try {
+        body = JSON.parse((await readBody(req)).toString("utf8"));
+      } catch (err) {
+        sendJson(res, 400, { error: "Invalid JSON" });
         return;
       }
-      setTimeout(() => {
-        if (!child.killed) {
+
+      const prompt = String(body.prompt || "").trim();
+      if (!prompt) {
+        sendJson(res, 400, { error: "Missing prompt" });
+        return;
+      }
+
+      setCors(res);
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+
+      const writeEvent = (event, data) => {
+        if (!res.writableEnded) {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        }
+      };
+
+      const keepaliveTimer = setInterval(() => {
+        if (!res.writableEnded) {
           try {
-            child.kill("SIGKILL");
+            res.write(": keepalive\n\n");
           } catch {
             // ignore
           }
         }
-      }, 3000).unref();
-    };
+      }, 15_000);
+      req.on("close", () => clearInterval(keepaliveTimer));
+      res.on("finish", () => clearInterval(keepaliveTimer));
 
-    req.on("close", killChildGracefully);
+      const requestedCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
+      const workspaceDir =
+        requestedCwd && fs.existsSync(requestedCwd) && fs.statSync(requestedCwd).isDirectory()
+          ? requestedCwd
+          : DEFAULT_WORKSPACE;
+      const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
 
-    child.on("error", (err) => {
-      if (!doneSent) {
-        writeEvent("error", { error: `Failed to start ${provider}: ${err.message}` });
+      const provider = String(body.provider || "claude").toLowerCase();
+      const finalSystemPrompt = buildVoiceSystemPrompt(body.systemPrompt, workspaceDir);
+      const effectivePrompt =
+        provider !== "claude" && finalSystemPrompt
+          ? `[Instructions: ${finalSystemPrompt}]\n\n${prompt}`
+          : prompt;
+
+      let bin = CLAUDE_BIN;
+      let args;
+      if (provider === "agy" || provider === "antigravity") {
+        bin = AGY_BIN;
+        args = [
+          "-p",
+          effectivePrompt,
+          "--output-format",
+          "stream-json",
+          "--mode",
+          "auto",
+        ];
+        if (body.sessionId) args.push("--conversation", String(body.sessionId));
+        if (body.model) args.push("--model", String(body.model));
+      } else if (provider === "opencode") {
+        bin = OPENCODE_BIN;
+        args = ["run", effectivePrompt, "--format", "json", "--auto"];
+        if (body.sessionId) args.push("-s", String(body.sessionId));
+        if (body.model) args.push("-m", String(body.model));
+      } else {
+        bin = CLAUDE_BIN;
+        args = [
+          "-p",
+          prompt,
+          "--output-format",
+          "stream-json",
+          "--include-partial-messages",
+          "--verbose",
+          "--permission-mode",
+          "auto",
+        ];
+        if (body.sessionId) args.push("--resume", String(body.sessionId));
+        if (body.model) args.push("--model", String(body.model));
+        if (finalSystemPrompt) {
+          args.push("--append-system-prompt", finalSystemPrompt);
+        }
       }
-      if (!res.writableEnded) res.end();
-    });
 
-    const formatToolStatus = (name, input) => {
-      const tool = String(name || "").trim();
-      const lower = tool.toLowerCase();
-      const target =
-        input?.file_path || input?.path || input?.query || input?.url || input?.pattern || "";
-      const shortTarget = target ? path.basename(String(target)).slice(0, 24) : "";
-      if (lower.includes("websearch") || lower.includes("search_web")) return "Searching web…";
-      if (lower.includes("webfetch") || lower.includes("fetch")) return "Fetching page…";
-      if (lower === "read" || lower.includes("read_file")) {
-        return shortTarget ? `Reading ${shortTarget}…` : "Reading file…";
-      }
-      if (lower === "edit" || lower === "write" || lower.includes("edit_file") || lower.includes("write_file")) {
-        return shortTarget ? `Editing ${shortTarget}…` : "Editing file…";
-      }
-      if (lower === "bash" || lower.includes("command")) return "Running command…";
-      if (lower === "grep" || lower === "glob") return "Searching codebase…";
-      return tool ? `Running ${tool}…` : "Working…";
-    };
+      const child = spawn(bin, args, {
+        cwd: workspaceDir,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
 
-    child.stdout.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      let idx;
-      while ((idx = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-        if (!line) continue;
+      activeChildren.add(child);
+      child.on("close", () => activeChildren.delete(child));
+
+      let buf = "";
+      let fullText = "";
+      let activeSessionId = body.sessionId || null;
+      let doneSent = false;
+
+      const sendDone = () => {
+        if (doneSent) return;
+        doneSent = true;
+        if (activeSessionId) {
+          recordBridgeTurn({
+            sessionId: activeSessionId,
+            cwd: workspaceDir,
+            provider,
+            model: body.model || provider,
+            userText: prompt,
+            assistantText: fullText,
+          });
+        }
+        writeEvent("done", { sessionId: activeSessionId, text: fullText });
+      };
+
+      const killChildGracefully = () => {
+        if (child.killed) return;
         try {
-          const ev = JSON.parse(line);
-          const sid = ev.session_id || ev.conversation_id || ev.sessionID || ev.result?.conversation_id;
-          if (sid && sid !== activeSessionId) {
-            activeSessionId = sid;
-            writeEvent("session", { sessionId: activeSessionId });
+          child.kill("SIGTERM");
+        } catch {
+          return;
+        }
+        setTimeout(() => {
+          if (!child.killed) {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // ignore
+            }
           }
+        }, 3000).unref();
+      };
 
-          if (provider === "agy" || provider === "antigravity") {
-            if (ev.event === "step_update" && ev.step_update?.tool_name) {
-              writeEvent("status", { status: formatToolStatus(ev.step_update.tool_name, ev.step_update.input) });
+      req.on("close", killChildGracefully);
+
+      child.on("error", (err) => {
+        if (!doneSent) {
+          writeEvent("error", { error: `Failed to start ${provider}: ${err.message}` });
+        }
+        if (!res.writableEnded) res.end();
+      });
+
+      const formatToolStatus = (name, input) => {
+        const tool = String(name || "").trim();
+        const lower = tool.toLowerCase();
+        const target =
+          input?.file_path || input?.path || input?.query || input?.url || input?.pattern || "";
+        const shortTarget = target ? path.basename(String(target)).slice(0, 24) : "";
+        if (lower.includes("websearch") || lower.includes("search_web")) return "Searching web…";
+        if (lower.includes("webfetch") || lower.includes("fetch")) return "Fetching page…";
+        if (lower === "read" || lower.includes("read_file")) {
+          return shortTarget ? `Reading ${shortTarget}…` : "Reading file…";
+        }
+        if (lower === "edit" || lower === "write" || lower.includes("edit_file") || lower.includes("write_file")) {
+          return shortTarget ? `Editing ${shortTarget}…` : "Editing file…";
+        }
+        if (lower === "bash" || lower.includes("command")) return "Running command…";
+        if (lower === "grep" || lower === "glob") return "Searching codebase…";
+        return tool ? `Running ${tool}…` : "Working…";
+      };
+
+      child.stdout.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        let idx;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const ev = JSON.parse(line);
+            const sid = ev.session_id || ev.conversation_id || ev.sessionID || ev.result?.conversation_id;
+            if (sid && sid !== activeSessionId) {
+              activeSessionId = sid;
+              writeEvent("session", { sessionId: activeSessionId });
             }
-            if (ev.event === "step_update" && ev.step_update?.text_delta) {
-              const delta = String(ev.step_update.text_delta);
-              fullText += delta;
-              writeEvent("text", { delta, fullText });
-            } else if (ev.event === "result") {
-              if (ev.result?.response && !fullText) fullText = String(ev.result.response);
-              sendDone();
-            }
-          } else if (provider === "opencode") {
-            if (ev.type === "tool_use" || ev.part?.type === "tool") {
-              writeEvent("status", {
-                status: formatToolStatus(ev.part?.tool || ev.tool, ev.part?.state?.input || ev.input),
-              });
-            } else if (ev.type === "text") {
-              const delta = String(ev.part?.text || ev.text || "");
+
+            if (provider === "agy" || provider === "antigravity") {
+              if (ev.event === "step_update" && ev.step_update?.tool_name) {
+                writeEvent("status", { status: formatToolStatus(ev.step_update.tool_name, ev.step_update.input) });
+              }
+              if (ev.event === "step_update" && ev.step_update?.text_delta) {
+                const delta = String(ev.step_update.text_delta);
+                fullText += delta;
+                writeEvent("text", { delta, fullText });
+              } else if (ev.event === "result") {
+                if (ev.result?.response && !fullText) fullText = String(ev.result.response);
+                sendDone();
+              }
+            } else if (provider === "opencode") {
+              if (ev.type === "tool_use" || ev.part?.type === "tool") {
+                writeEvent("status", {
+                  status: formatToolStatus(ev.part?.tool || ev.tool, ev.part?.state?.input || ev.input),
+                });
+              } else if (ev.type === "text") {
+                const delta = String(ev.part?.text || ev.text || "");
+                if (delta) {
+                  fullText += delta;
+                  writeEvent("text", { delta, fullText });
+                }
+              } else if (ev.type === "error") {
+                const msg = ev.error?.data?.message || ev.error?.message || "OpenCode error";
+                writeEvent("error", { error: msg });
+                doneSent = true;
+              }
+            } else if (
+              ev.type === "stream_event" &&
+              ev.event?.type === "content_block_start" &&
+              ev.event?.content_block?.type === "tool_use"
+            ) {
+              writeEvent("status", { status: formatToolStatus(ev.event.content_block.name, null) });
+            } else if (
+              ev.type === "stream_event" &&
+              ev.event?.type === "content_block_delta" &&
+              ev.event?.delta?.type === "text_delta" &&
+              typeof ev.event.delta.text === "string"
+            ) {
+              const delta = ev.event.delta.text;
               if (delta) {
                 fullText += delta;
                 writeEvent("text", { delta, fullText });
               }
-            } else if (ev.type === "error") {
-              const msg = ev.error?.data?.message || ev.error?.message || "OpenCode error";
-              writeEvent("error", { error: msg });
-              doneSent = true;
+            } else if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
+              const nextText = ev.message.content
+                .filter((b) => b.type === "text")
+                .map((b) => b.text)
+                .join("\n");
+              if (nextText && nextText.length > fullText.length) {
+                const delta = nextText.startsWith(fullText)
+                  ? nextText.slice(fullText.length)
+                  : nextText;
+                fullText = nextText;
+                writeEvent("text", { delta, fullText });
+              }
+            } else if (ev.type === "result") {
+              if (ev.result && !fullText) fullText = ev.result;
+              sendDone();
             }
-          } else if (
-            ev.type === "stream_event" &&
-            ev.event?.type === "content_block_start" &&
-            ev.event?.content_block?.type === "tool_use"
-          ) {
-            writeEvent("status", { status: formatToolStatus(ev.event.content_block.name, null) });
-          } else if (
-            ev.type === "stream_event" &&
-            ev.event?.type === "content_block_delta" &&
-            ev.event?.delta?.type === "text_delta" &&
-            typeof ev.event.delta.text === "string"
-          ) {
-            const delta = ev.event.delta.text;
-            if (delta) {
-              fullText += delta;
-              writeEvent("text", { delta, fullText });
-            }
-          } else if (ev.type === "assistant" && Array.isArray(ev.message?.content)) {
-            const nextText = ev.message.content
-              .filter((b) => b.type === "text")
-              .map((b) => b.text)
-              .join("\n");
-            if (nextText && nextText.length > fullText.length) {
-              const delta = nextText.startsWith(fullText)
-                ? nextText.slice(fullText.length)
-                : nextText;
-              fullText = nextText;
-              writeEvent("text", { delta, fullText });
-            }
-          } else if (ev.type === "result") {
-            if (ev.result && !fullText) fullText = ev.result;
-            sendDone();
+          } catch {
+            // ignore non-json line
           }
-        } catch {
-          // ignore non-json line
         }
-      }
-    });
+      });
 
-    let errTail = "";
-    child.stderr.on("data", (c) => {
-      errTail = (errTail + c.toString("utf8")).slice(-1000);
-    });
+      let errTail = "";
+      child.stderr.on("data", (c) => {
+        errTail = (errTail + c.toString("utf8")).slice(-1000);
+      });
 
-    child.on("close", (code) => {
-      if (code !== 0 && !fullText && !doneSent) {
-        writeEvent("error", { error: errTail || `${provider} exited ${code}` });
-      } else {
-        sendDone();
-      }
-      if (!res.writableEnded) res.end();
-    });
-    return;
-  }
+      child.on("close", (code) => {
+        if (code !== 0 && !fullText && !doneSent) {
+          writeEvent("error", { error: errTail || `${provider} exited ${code}` });
+        } else {
+          sendDone();
+        }
+        if (!res.writableEnded) res.end();
+      });
+      return;
+    }
 
-  sendJson(res, 404, { error: "Not found" });
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("[claudian-bridge] unhandledRejection:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[claudian-bridge] uncaughtException:", err);
-});
-
-let mdnsSocket = null;
-
-function encodeDnsName(name) {
-  const parts = name.replace(/\.$/, "").split(".").filter(Boolean);
-  const bufs = parts.map((label) => {
-    const b = Buffer.from(label, "utf8");
-    return Buffer.concat([Buffer.from([b.length]), b]);
+    sendJson(res, 404, { error: "Not found" });
   });
-  return Buffer.concat([...bufs, Buffer.from([0])]);
-}
 
-function decodeDnsName(msg, offset) {
-  const labels = [];
-  let pos = offset;
-  let jumped = false;
-  let nextOffset = offset;
-  const seen = new Set();
-  while (pos < msg.length) {
-    if (seen.has(pos)) break;
-    seen.add(pos);
-    const len = msg[pos];
-    if (len === 0) {
-      if (!jumped) nextOffset = pos + 1;
-      break;
-    }
-    if ((len & 0xc0) === 0xc0 && pos + 1 < msg.length) {
-      if (!jumped) nextOffset = pos + 2;
-      pos = ((len & 0x3f) << 8) | msg[pos + 1];
-      jumped = true;
-      continue;
-    }
-    pos += 1;
-    labels.push(msg.subarray(pos, pos + len).toString("utf8"));
-    pos += len;
-  }
-  return { name: labels.join(".").toLowerCase(), nextOffset };
-}
+  let mdnsSocket = null;
 
-function buildDnsRecord(name, type, ttl, rdata, cacheFlush = false) {
-  const header = Buffer.alloc(10);
-  header.writeUInt16BE(type, 0);
-  header.writeUInt16BE(cacheFlush ? 0x8001 : 0x0001, 2);
-  header.writeUInt32BE(ttl, 4);
-  header.writeUInt16BE(rdata.length, 8);
-  return Buffer.concat([encodeDnsName(name), header, rdata]);
-}
-
-function getLanIpv4Addresses() {
-  const ips = [];
-  const ifaces = os.networkInterfaces();
-  for (const entries of Object.values(ifaces)) {
-    for (const info of entries || []) {
-      if (info.family === "IPv4" && !info.internal) {
-        ips.push(info.address);
-      }
-    }
-  }
-  return ips;
-}
-
-function buildMdnsAnnouncement() {
-  const rawHost = os.hostname().replace(/[^a-zA-Z0-9-]/g, "-") || "claudian";
-  const hostFqdn = `${rawHost}.local`;
-  const serviceType = "_claudian._tcp.local";
-  const instanceName = `${rawHost}.${serviceType}`;
-  const ips = getLanIpv4Addresses();
-  if (ips.length === 0) return null;
-
-  const txtParts = [Buffer.from("v=1"), Buffer.from(`port=${PORT}`)].map((b) =>
-    Buffer.concat([Buffer.from([b.length]), b])
-  );
-  const txtRdata = Buffer.concat(txtParts);
-  const srvRdata = Buffer.concat([
-    Buffer.from([0, 0, 0, 0, (PORT >> 8) & 0xff, PORT & 0xff]),
-    encodeDnsName(hostFqdn),
-  ]);
-
-  const answers = [
-    buildDnsRecord(serviceType, 12, 120, encodeDnsName(instanceName), false),
-    buildDnsRecord(instanceName, 33, 120, srvRdata, true),
-    buildDnsRecord(instanceName, 16, 120, txtRdata, true),
-  ];
-  for (const ip of ips) {
-    const octets = ip.split(".").map((n) => Number(n) & 0xff);
-    if (octets.length === 4) {
-      answers.push(buildDnsRecord(hostFqdn, 1, 120, Buffer.from(octets), true));
-    }
-  }
-
-  const hdr = Buffer.alloc(12);
-  hdr.writeUInt16BE(0x8400, 2);
-  hdr.writeUInt16BE(answers.length, 6);
-  return Buffer.concat([hdr, ...answers]);
-}
-
-function startMdnsAdvertiser() {
-  if (process.env.CLAUDIAN_DISABLE_MDNS === "1") return;
-  try {
-    const sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
-    mdnsSocket = sock;
-    sock.on("error", (err) => {
-      console.warn("[claudian-bridge] mDNS error:", err?.message || err);
+  function encodeDnsName(name) {
+    const parts = name.replace(/\.$/, "").split(".").filter(Boolean);
+    const bufs = parts.map((label) => {
+      const b = Buffer.from(label, "utf8");
+      return Buffer.concat([Buffer.from([b.length]), b]);
     });
-    sock.on("message", (msg) => {
-      if (msg.length < 12) return;
-      const flags = msg.readUInt16BE(2);
-      if ((flags & 0x8000) !== 0) return;
-      const qdCount = msg.readUInt16BE(4);
-      let offset = 12;
-      let matched = false;
-      for (let i = 0; i < qdCount && offset < msg.length; i++) {
-        const { name, nextOffset } = decodeDnsName(msg, offset);
-        offset = nextOffset + 4;
-        if (name === "_claudian._tcp.local" || name === "_services._dns-sd._udp.local") {
-          matched = true;
-          break;
+    return Buffer.concat([...bufs, Buffer.from([0])]);
+  }
+
+  function decodeDnsName(msg, offset) {
+    const labels = [];
+    let pos = offset;
+    let jumped = false;
+    let nextOffset = offset;
+    const seen = new Set();
+    while (pos < msg.length) {
+      if (seen.has(pos)) break;
+      seen.add(pos);
+      const len = msg[pos];
+      if (len === 0) {
+        if (!jumped) nextOffset = pos + 1;
+        break;
+      }
+      if ((len & 0xc0) === 0xc0 && pos + 1 < msg.length) {
+        if (!jumped) nextOffset = pos + 2;
+        pos = ((len & 0x3f) << 8) | msg[pos + 1];
+        jumped = true;
+        continue;
+      }
+      pos += 1;
+      labels.push(msg.subarray(pos, pos + len).toString("utf8"));
+      pos += len;
+    }
+    return { name: labels.join(".").toLowerCase(), nextOffset };
+  }
+
+  function buildDnsRecord(name, type, ttl, rdata, cacheFlush = false) {
+    const header = Buffer.alloc(10);
+    header.writeUInt16BE(type, 0);
+    header.writeUInt16BE(cacheFlush ? 0x8001 : 0x0001, 2);
+    header.writeUInt32BE(ttl, 4);
+    header.writeUInt16BE(rdata.length, 8);
+    return Buffer.concat([encodeDnsName(name), header, rdata]);
+  }
+
+  function getLanIpv4Addresses() {
+    const ips = [];
+    const ifaces = os.networkInterfaces();
+    for (const entries of Object.values(ifaces)) {
+      for (const info of entries || []) {
+        if (info.family === "IPv4" && !info.internal) {
+          ips.push(info.address);
         }
       }
-      if (matched) {
+    }
+    return ips;
+  }
+
+  function buildMdnsAnnouncement() {
+    const rawHost = os.hostname().replace(/[^a-zA-Z0-9-]/g, "-") || "claudian";
+    const hostFqdn = `${rawHost}.local`;
+    const serviceType = "_claudian._tcp.local";
+    const instanceName = `${rawHost}.${serviceType}`;
+    const ips = getLanIpv4Addresses();
+    if (ips.length === 0) return null;
+
+    const txtParts = [Buffer.from("v=1"), Buffer.from(`port=${PORT}`)].map((b) =>
+      Buffer.concat([Buffer.from([b.length]), b])
+    );
+    const txtRdata = Buffer.concat(txtParts);
+    const srvRdata = Buffer.concat([
+      Buffer.from([0, 0, 0, 0, (PORT >> 8) & 0xff, PORT & 0xff]),
+      encodeDnsName(hostFqdn),
+    ]);
+
+    const answers = [
+      buildDnsRecord(serviceType, 12, 120, encodeDnsName(instanceName), false),
+      buildDnsRecord(instanceName, 33, 120, srvRdata, true),
+      buildDnsRecord(instanceName, 16, 120, txtRdata, true),
+    ];
+    for (const ip of ips) {
+      const octets = ip.split(".").map((n) => Number(n) & 0xff);
+      if (octets.length === 4) {
+        answers.push(buildDnsRecord(hostFqdn, 1, 120, Buffer.from(octets), true));
+      }
+    }
+
+    const hdr = Buffer.alloc(12);
+    hdr.writeUInt16BE(0x8400, 2);
+    hdr.writeUInt16BE(answers.length, 6);
+    return Buffer.concat([hdr, ...answers]);
+  }
+
+  function startMdnsAdvertiser() {
+    if (env.CLAUDIAN_DISABLE_MDNS === "1" || opts.mdns === false) return;
+    try {
+      const sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+      mdnsSocket = sock;
+      sock.on("error", (err) => {
+        console.warn("[claudian-bridge] mDNS error:", err?.message || err);
+      });
+      sock.on("message", (msg) => {
+        if (msg.length < 12) return;
+        const flags = msg.readUInt16BE(2);
+        if ((flags & 0x8000) !== 0) return;
+        const qdCount = msg.readUInt16BE(4);
+        let offset = 12;
+        let matched = false;
+        for (let i = 0; i < qdCount && offset < msg.length; i++) {
+          const { name, nextOffset } = decodeDnsName(msg, offset);
+          offset = nextOffset + 4;
+          if (name === "_claudian._tcp.local" || name === "_services._dns-sd._udp.local") {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) {
+          const packet = buildMdnsAnnouncement();
+          if (packet) sock.send(packet, 5353, "224.0.0.251");
+        }
+      });
+      sock.bind(5353, () => {
+        try {
+          sock.addMembership("224.0.0.251");
+        } catch {}
         const packet = buildMdnsAnnouncement();
         if (packet) sock.send(packet, 5353, "224.0.0.251");
-      }
-    });
-    sock.bind(5353, () => {
-      try {
-        sock.addMembership("224.0.0.251");
-      } catch {}
-      const packet = buildMdnsAnnouncement();
-      if (packet) sock.send(packet, 5353, "224.0.0.251");
-      console.log("[claudian-bridge] mDNS advertising _claudian._tcp.local");
-    });
-  } catch (err) {
-    console.warn("[claudian-bridge] mDNS disabled:", err?.message || err);
+        console.log("[claudian-bridge] mDNS advertising _claudian._tcp.local");
+      });
+    } catch (err) {
+      console.warn("[claudian-bridge] mDNS disabled:", err?.message || err);
+    }
   }
+
+  function stopMdns() {
+    if (mdnsSocket) {
+      try { mdnsSocket.close(); } catch {}
+      mdnsSocket = null;
+    }
+  }
+
+  // Start listening; resolves once bound (PORT is updated, so port 0 works).
+  function start() {
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(PORT, HOST, () => {
+        server.off("error", reject);
+        PORT = server.address().port;
+        if (opts.cleanupTempFiles !== false) cleanupStaleTempFiles();
+        startMdnsAdvertiser();
+        console.log(`[claudian-bridge] listening on http://${HOST}:${PORT} (vault=${VAULT_DIR})`);
+        console.log(`[claudian-bridge] token saved at ${CONFIG_PATH}`);
+        if (opts.warmWorkers !== false) {
+          sttWorker.ensure().then(
+            () => console.log("[claudian-bridge] sttWorker warmed"),
+            (err) => console.warn("[claudian-bridge] sttWorker warmup failed:", err?.message || err),
+          );
+          ttsWorker.ensure().then(
+            () => console.log("[claudian-bridge] ttsWorker warmed"),
+            (err) => console.warn("[claudian-bridge] ttsWorker warmup failed:", err?.message || err),
+          );
+        }
+        resolve(api);
+      });
+    });
+  }
+
+  // Full teardown for tests: workers, mDNS, in-flight agent children, sockets.
+  function stop() {
+    stopMdns();
+    sttWorker.dispose();
+    ttsWorker.dispose();
+    for (const child of activeChildren) {
+      try { child.kill("SIGKILL"); } catch {}
+    }
+    return new Promise((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+  }
+
+  const api = {
+    server,
+    start,
+    stop,
+    stopMdns,
+    sttWorker,
+    ttsWorker,
+    get port() { return PORT; },
+    host: HOST,
+    token: AUTH_TOKEN,
+    configDir: CONFIG_DIR,
+    configPath: CONFIG_PATH,
+    workspacesRoot: WORKSPACES_ROOT,
+    workspaceDir: DEFAULT_WORKSPACE,
+  };
+  return api;
 }
 
-function shutdown(signal) {
-  console.log(`[claudian-bridge] received ${signal}, shutting down...`);
-  if (mdnsSocket) {
-    try { mdnsSocket.close(); } catch {}
-    mdnsSocket = null;
+// Process-level behavior (signals, global error handlers, self-start) only when
+// run as `node server.mjs`, never when imported by tests.
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
   }
-  sttWorker.dispose();
-  ttsWorker.dispose();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 5000).unref();
+})();
+if (isMain) {
+  const app = createServer();
+
+  process.on("unhandledRejection", (err) => {
+    console.error("[claudian-bridge] unhandledRejection:", err);
+  });
+
+  process.on("uncaughtException", (err) => {
+    console.error("[claudian-bridge] uncaughtException:", err);
+  });
+
+  const shutdown = (signal) => {
+    console.log(`[claudian-bridge] received ${signal}, shutting down...`);
+    app.stopMdns();
+    app.sttWorker.dispose();
+    app.ttsWorker.dispose();
+    app.server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  app.start().catch((err) => {
+    console.error("[claudian-bridge] failed to listen:", err);
+    process.exit(1);
+  });
 }
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-
-server.listen(PORT, HOST, () => {
-  cleanupStaleTempFiles();
-  startMdnsAdvertiser();
-  console.log(`[claudian-bridge] listening on http://${HOST}:${PORT} (vault=${VAULT_DIR})`);
-  console.log(`[claudian-bridge] token saved at ${CONFIG_PATH}`);
-  sttWorker.ensure().then(
-    () => console.log("[claudian-bridge] sttWorker warmed"),
-    (err) => console.warn("[claudian-bridge] sttWorker warmup failed:", err?.message || err),
-  );
-  ttsWorker.ensure().then(
-    () => console.log("[claudian-bridge] ttsWorker warmed"),
-    (err) => console.warn("[claudian-bridge] ttsWorker warmup failed:", err?.message || err),
-  );
-});
