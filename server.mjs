@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -79,13 +80,41 @@ const STT_WORKER =
   (fs.existsSync(path.join(__dirname, "stt_worker.py"))
     ? path.join(__dirname, "stt_worker.py")
     : path.resolve(__dirname, "../claudian-voice/stt_worker.py"));
+function firstExisting(candidates) {
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return candidates[0];
+}
+
+const KOKORO_CACHE_BRIDGE = path.join(os.homedir(), ".cache", "claudian-bridge");
+const KOKORO_CACHE_READ_ALOUD = path.join(os.homedir(), ".cache", "obsidian-read-aloud");
 const KOKORO_ROOT =
   process.env.CLAUDIAN_KOKORO_ROOT ||
-  path.join(os.homedir(), ".cache", "obsidian-read-aloud");
-const KOKORO_PYTHON = path.join(KOKORO_ROOT, "venv", "bin", "python");
-const KOKORO_WORKER = path.join(KOKORO_ROOT, "kokoro_worker.py");
-const KOKORO_MODEL = path.join(KOKORO_ROOT, "models", "kokoro", "kokoro-v1.0.int8.onnx");
-const KOKORO_VOICES = path.join(KOKORO_ROOT, "models", "kokoro", "voices-v1.0.bin");
+  (fs.existsSync(path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro"))
+    ? KOKORO_CACHE_BRIDGE
+    : KOKORO_CACHE_READ_ALOUD);
+const KOKORO_PYTHON = firstExisting([
+  process.env.CLAUDIAN_KOKORO_PYTHON,
+  path.join(KOKORO_ROOT, "venv", "bin", "python"),
+  path.join(KOKORO_CACHE_READ_ALOUD, "venv", "bin", "python"),
+  STT_PYTHON,
+]);
+const KOKORO_WORKER = firstExisting([
+  process.env.CLAUDIAN_KOKORO_WORKER,
+  path.join(__dirname, "kokoro_worker.py"),
+  path.join(KOKORO_ROOT, "kokoro_worker.py"),
+]);
+const KOKORO_MODEL = firstExisting([
+  path.join(KOKORO_ROOT, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+  path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+  path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "kokoro-v1.0.int8.onnx"),
+]);
+const KOKORO_VOICES = firstExisting([
+  path.join(KOKORO_ROOT, "models", "kokoro", "voices-v1.0.bin"),
+  path.join(KOKORO_CACHE_BRIDGE, "models", "kokoro", "voices-v1.0.bin"),
+  path.join(KOKORO_CACHE_READ_ALOUD, "models", "kokoro", "voices-v1.0.bin"),
+]);
 
 function resolveApkPaths() {
   const candidates = [
@@ -1314,8 +1343,148 @@ process.on("uncaughtException", (err) => {
   console.error("[claudian-bridge] uncaughtException:", err);
 });
 
+let mdnsSocket = null;
+
+function encodeDnsName(name) {
+  const parts = name.replace(/\.$/, "").split(".").filter(Boolean);
+  const bufs = parts.map((label) => {
+    const b = Buffer.from(label, "utf8");
+    return Buffer.concat([Buffer.from([b.length]), b]);
+  });
+  return Buffer.concat([...bufs, Buffer.from([0])]);
+}
+
+function decodeDnsName(msg, offset) {
+  const labels = [];
+  let pos = offset;
+  let jumped = false;
+  let nextOffset = offset;
+  const seen = new Set();
+  while (pos < msg.length) {
+    if (seen.has(pos)) break;
+    seen.add(pos);
+    const len = msg[pos];
+    if (len === 0) {
+      if (!jumped) nextOffset = pos + 1;
+      break;
+    }
+    if ((len & 0xc0) === 0xc0 && pos + 1 < msg.length) {
+      if (!jumped) nextOffset = pos + 2;
+      pos = ((len & 0x3f) << 8) | msg[pos + 1];
+      jumped = true;
+      continue;
+    }
+    pos += 1;
+    labels.push(msg.subarray(pos, pos + len).toString("utf8"));
+    pos += len;
+  }
+  return { name: labels.join(".").toLowerCase(), nextOffset };
+}
+
+function buildDnsRecord(name, type, ttl, rdata, cacheFlush = false) {
+  const header = Buffer.alloc(10);
+  header.writeUInt16BE(type, 0);
+  header.writeUInt16BE(cacheFlush ? 0x8001 : 0x0001, 2);
+  header.writeUInt32BE(ttl, 4);
+  header.writeUInt16BE(rdata.length, 8);
+  return Buffer.concat([encodeDnsName(name), header, rdata]);
+}
+
+function getLanIpv4Addresses() {
+  const ips = [];
+  const ifaces = os.networkInterfaces();
+  for (const entries of Object.values(ifaces)) {
+    for (const info of entries || []) {
+      if (info.family === "IPv4" && !info.internal) {
+        ips.push(info.address);
+      }
+    }
+  }
+  return ips;
+}
+
+function buildMdnsAnnouncement() {
+  const rawHost = os.hostname().replace(/[^a-zA-Z0-9-]/g, "-") || "claudian";
+  const hostFqdn = `${rawHost}.local`;
+  const serviceType = "_claudian._tcp.local";
+  const instanceName = `${rawHost}.${serviceType}`;
+  const ips = getLanIpv4Addresses();
+  if (ips.length === 0) return null;
+
+  const txtParts = [Buffer.from("v=1"), Buffer.from(`port=${PORT}`)].map((b) =>
+    Buffer.concat([Buffer.from([b.length]), b])
+  );
+  const txtRdata = Buffer.concat(txtParts);
+  const srvRdata = Buffer.concat([
+    Buffer.from([0, 0, 0, 0, (PORT >> 8) & 0xff, PORT & 0xff]),
+    encodeDnsName(hostFqdn),
+  ]);
+
+  const answers = [
+    buildDnsRecord(serviceType, 12, 120, encodeDnsName(instanceName), false),
+    buildDnsRecord(instanceName, 33, 120, srvRdata, true),
+    buildDnsRecord(instanceName, 16, 120, txtRdata, true),
+  ];
+  for (const ip of ips) {
+    const octets = ip.split(".").map((n) => Number(n) & 0xff);
+    if (octets.length === 4) {
+      answers.push(buildDnsRecord(hostFqdn, 1, 120, Buffer.from(octets), true));
+    }
+  }
+
+  const hdr = Buffer.alloc(12);
+  hdr.writeUInt16BE(0x8400, 2);
+  hdr.writeUInt16BE(answers.length, 6);
+  return Buffer.concat([hdr, ...answers]);
+}
+
+function startMdnsAdvertiser() {
+  if (process.env.CLAUDIAN_DISABLE_MDNS === "1") return;
+  try {
+    const sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    mdnsSocket = sock;
+    sock.on("error", (err) => {
+      console.warn("[claudian-bridge] mDNS error:", err?.message || err);
+    });
+    sock.on("message", (msg) => {
+      if (msg.length < 12) return;
+      const flags = msg.readUInt16BE(2);
+      if ((flags & 0x8000) !== 0) return;
+      const qdCount = msg.readUInt16BE(4);
+      let offset = 12;
+      let matched = false;
+      for (let i = 0; i < qdCount && offset < msg.length; i++) {
+        const { name, nextOffset } = decodeDnsName(msg, offset);
+        offset = nextOffset + 4;
+        if (name === "_claudian._tcp.local" || name === "_services._dns-sd._udp.local") {
+          matched = true;
+          break;
+        }
+      }
+      if (matched) {
+        const packet = buildMdnsAnnouncement();
+        if (packet) sock.send(packet, 5353, "224.0.0.251");
+      }
+    });
+    sock.bind(5353, () => {
+      try {
+        sock.addMembership("224.0.0.251");
+      } catch {}
+      const packet = buildMdnsAnnouncement();
+      if (packet) sock.send(packet, 5353, "224.0.0.251");
+      console.log("[claudian-bridge] mDNS advertising _claudian._tcp.local");
+    });
+  } catch (err) {
+    console.warn("[claudian-bridge] mDNS disabled:", err?.message || err);
+  }
+}
+
 function shutdown(signal) {
   console.log(`[claudian-bridge] received ${signal}, shutting down...`);
+  if (mdnsSocket) {
+    try { mdnsSocket.close(); } catch {}
+    mdnsSocket = null;
+  }
   sttWorker.dispose();
   ttsWorker.dispose();
   server.close(() => process.exit(0));
@@ -1327,6 +1496,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, HOST, () => {
   cleanupStaleTempFiles();
+  startMdnsAdvertiser();
   console.log(`[claudian-bridge] listening on http://${HOST}:${PORT} (vault=${VAULT_DIR})`);
   console.log(`[claudian-bridge] token saved at ${CONFIG_PATH}`);
   sttWorker.ensure().then(

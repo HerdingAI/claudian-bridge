@@ -2,15 +2,22 @@
 
 Lightweight, zero-dependency Node.js HTTP/SSE bridge server that exposes **Claude Code** (`claude`), **Antigravity** (`agy`), **OpenCode** (`opencode`), local **faster-whisper STT**, and local **Kokoro TTS** to **Claudian Mobile** and **Claudian Call** over Tailscale or LAN.
 
-## Quick Start
+## Quick Start (2-Step Setup)
 
 ```bash
-node server.mjs
+git clone https://github.com/HerdingAI/claudian-bridge.git
+cd claudian-bridge
+./setup.sh
 ```
 
-On first run, an auth token is generated and saved atomically to `~/.config/claudian-bridge/config.json` (`0600`).
+`./setup.sh` automatically:
+1. Creates `~/.venvs/audio` and installs `faster-whisper`, `kokoro-onnx`, `soundfile`, and `qrcode`.
+2. Downloads the Kokoro v1.0 ONNX voice models (`kokoro-v1.0.int8.onnx` & `voices-v1.0.bin`) into `~/.cache/claudian-bridge/models/kokoro/`.
+3. Generates an auth token in `~/.config/claudian-bridge/config.json` (`0600`).
+4. Installs and starts `systemd --user` (`claudian-bridge.service`) on Linux (with `loginctl enable-linger` and `Restart=always`), or starts in background when `systemd --user` is unavailable.
+5. Advertises `_claudian._tcp.local` via mDNS for LAN auto-discovery and prints a **scannable QR code** (`claudian://pair?url=...&token=...`) for 1-tap pairing in **Claudian Call** over LAN or Tailscale.
 
-For always-on operation across reboots and power loss, run via `systemd --user` (`~/.config/systemd/user/claudian-bridge.service`) with `loginctl enable-linger` and `Restart=always` / `StartLimitIntervalSec=0`.
+> To run manually without `setup.sh`: `node server.mjs`
 
 ## Configuration (Environment Variables)
 
