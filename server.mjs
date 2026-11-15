@@ -120,7 +120,9 @@ function resolveApkPaths() {
   const candidates = [
     process.env.CLAUDIAN_CALL_APK,
     path.join(__dirname, "claudian-call.apk"),
+    path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/direct/debug/app-direct-debug.apk"),
     path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/debug/app-debug.apk"),
+    path.resolve(__dirname, "../claudian-call/dist/claudian-call.apk"),
   ].filter(Boolean);
   for (const p of candidates) {
     if (fs.existsSync(p)) {
