@@ -10,15 +10,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(here, "fixtures");
 export const TOKEN = "test-token-0123456789";
 
+// Stand-in for PersistentJsonWorker: records requests, never spawns Python.
+// The TTS flavour writes a tiny RIFF/WAVE header to out_wav like the real worker would.
 export function stubWorker(name = "stub") {
   return {
     name,
     calls: [],
+    disposed: 0,
     ensure: async () => {},
-    dispose() {},
+    dispose() { this.disposed++; },
     async request(payload) {
       this.calls.push(payload);
-      return { ok: true, text: "stub transcript" };
+      if (payload.out_wav) {
+        fs.writeFileSync(payload.out_wav, Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]));
+        return { ok: true };
+      }
+      return { ok: true, text: "stub transcript", language: payload.language };
     },
   };
 }
@@ -48,8 +55,10 @@ export async function startBridge(opts = {}) {
     mdns: false,
     warmWorkers: false,
     cleanupTempFiles: false,
-    sttWorker: stubWorker("stt"),
-    ttsWorker: stubWorker("tts"),
+    jobHangTimeoutMs: opts.jobHangTimeoutMs,
+    authBackoffThreshold: opts.authBackoffThreshold ?? 100,
+    sttWorker: opts.sttWorker || stubWorker("stt"),
+    ttsWorker: opts.ttsWorker || stubWorker("tts"),
     env: {
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
       FAKE_LOG: logPath,

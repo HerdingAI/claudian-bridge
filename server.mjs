@@ -6,6 +6,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { JobManager } from "./job-manager.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -54,7 +55,11 @@ export function createServer(opts = {}) {
   const env = { ...process.env, ...(opts.env || {}) };
   const homeDir = opts.homeDir || os.homedir();
   let PORT = Number(opts.port ?? (env.CLAUDIAN_BRIDGE_PORT || 8790));
-  const HOST = opts.host || env.CLAUDIAN_BRIDGE_HOST || "0.0.0.0";
+  const HOST = opts.host || env.CLAUDIAN_BIND || env.CLAUDIAN_BRIDGE_HOST || "0.0.0.0";
+  const BRIDGE_VERSION = "0.1.0";
+  const MAX_CONCURRENT_JOBS = Math.max(1, Number(env.CLAUDIAN_MAX_CONCURRENT_JOBS || 3));
+  const AUTH_BACKOFF_THRESHOLD = Math.max(1, Number(opts.authBackoffThreshold ?? (env.CLAUDIAN_AUTH_BACKOFF_THRESHOLD || 5)));
+  let activeAgentCount = 0;
   const DEFAULT_WORKSPACE =
     opts.workspaceDir ||
     env.CLAUDIAN_WORKSPACE_DIR ||
@@ -374,6 +379,58 @@ export function createServer(opts = {}) {
   ]);
 
   const activeChildren = new Set();
+
+  function buildProviderSpawn(job, systemPrompt) {
+    const provider = String(job.provider || "claude").toLowerCase();
+    const finalSystemPrompt = buildVoiceSystemPrompt(systemPrompt, job.cwd);
+    const effectivePrompt =
+      provider !== "claude" && finalSystemPrompt
+        ? `[Instructions: ${finalSystemPrompt}]\n\n${job.prompt}`
+        : job.prompt;
+
+    let bin = CLAUDE_BIN;
+    let args;
+    if (provider === "agy" || provider === "antigravity") {
+      bin = AGY_BIN;
+      args = ["-p", effectivePrompt, "--output-format", "stream-json", "--mode", "auto"];
+      if (job.sessionId) args.push("--conversation", String(job.sessionId));
+      if (job.model) args.push("--model", String(job.model));
+    } else if (provider === "opencode") {
+      bin = OPENCODE_BIN;
+      args = ["run", effectivePrompt, "--format", "json", "--auto"];
+      if (job.sessionId) args.push("-s", String(job.sessionId));
+      if (job.model) args.push("-m", String(job.model));
+    } else {
+      bin = CLAUDE_BIN;
+      args = [
+        "-p",
+        job.prompt,
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--permission-mode",
+        "auto",
+      ];
+      if (job.sessionId) args.push("--resume", String(job.sessionId));
+      if (job.model) args.push("--model", String(job.model));
+      if (finalSystemPrompt) args.push("--append-system-prompt", finalSystemPrompt);
+    }
+    return spawn(bin, args, {
+      cwd: job.cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  const jobManager = new JobManager({
+    configDir: CONFIG_DIR,
+    hangTimeoutMs: opts.jobHangTimeoutMs ?? Number(env.CLAUDIAN_JOB_HANG_MS || 5 * 60_000),
+    approvalTimeoutMs: opts.approvalTimeoutMs ?? Number(env.CLAUDIAN_APPROVAL_TIMEOUT_MS || 10 * 60_000),
+    spawnJobProcess: buildProviderSpawn,
+    onTurnComplete: recordBridgeTurn,
+    onAudit: (entry) => auditLog(entry),
+  });
   const modelCache = new Map();
   const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -459,14 +516,96 @@ export function createServer(opts = {}) {
     return models;
   }
 
-  function setCors(res) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  const ALLOWED_CORS_ORIGINS = new Set([
+    "app://obsidian.md",
+    "capacitor://localhost",
+    "http://localhost",
+  ]);
+  const DEVICES_FILE = path.join(CONFIG_DIR, "devices.json");
+  const AUDIT_FILE = path.join(CONFIG_DIR, "audit.jsonl");
+  const failedAuthByIp = new Map();
+
+  function sha256Hex(str) {
+    return crypto.createHash("sha256").update(String(str || "")).digest("hex");
   }
 
-  function sendJson(res, status, obj) {
-    setCors(res);
+  function constantTimeTokenMatch(a, b) {
+    const ha = crypto.createHash("sha256").update(String(a || "")).digest();
+    const hb = crypto.createHash("sha256").update(String(b || "")).digest();
+    return crypto.timingSafeEqual(ha, hb);
+  }
+
+  function loadDevices() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(DEVICES_FILE, "utf8"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveDevices(devices) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(DEVICES_FILE, 0o600); } catch {}
+  }
+
+  function auditLog(entry) {
+    try {
+      fs.mkdirSync(CONFIG_DIR, { recursive: true });
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+      fs.appendFileSync(AUDIT_FILE, line, { mode: 0o600 });
+      try { fs.chmodSync(AUDIT_FILE, 0o600); } catch {}
+    } catch {
+      // ignore audit write errors
+    }
+  }
+
+  function resolveWorkspaceCwd(requestedCwd) {
+    const raw = typeof requestedCwd === "string" ? requestedCwd.trim() : "";
+    if (!raw) return DEFAULT_WORKSPACE;
+    const rootReal = fs.realpathSync(WORKSPACES_ROOT);
+    const targetReal = fs.realpathSync(raw);
+    const stat = fs.statSync(targetReal);
+    if (!stat.isDirectory()) throw new Error("Not a directory");
+    if (targetReal !== rootReal && !targetReal.startsWith(rootReal + path.sep)) {
+      throw new Error("Outside WORKSPACES_ROOT");
+    }
+    return targetReal;
+  }
+
+  function authenticateRequest(req) {
+    const auth = req.headers.authorization || "";
+    if (!auth.startsWith("Bearer ")) return null;
+    const token = auth.slice(7);
+    if (!token) return null;
+
+    const devices = loadDevices();
+    for (const dev of devices) {
+      if (dev.tokenHash && constantTimeTokenMatch(sha256Hex(token), dev.tokenHash)) {
+        dev.lastUsedAt = Date.now();
+        saveDevices(devices);
+        return { deviceId: dev.id, legacy: false };
+      }
+    }
+    if (constantTimeTokenMatch(token, AUTH_TOKEN)) {
+      return { deviceId: "legacy", legacy: true };
+    }
+    return null;
+  }
+
+  function setCors(res, req) {
+    const origin = req?.headers?.origin;
+    if (origin && ALLOWED_CORS_ORIGINS.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  }
+
+  function sendJson(res, status, obj, req = null) {
+    setCors(res, req);
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(obj));
   }
@@ -717,32 +856,116 @@ export function createServer(opts = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    setCors(res);
+    setCors(res, req);
     if (req.method === "OPTIONS") {
+      const origin = req.headers.origin;
+      if (origin && !ALLOWED_CORS_ORIGINS.has(origin)) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
       res.writeHead(204);
       res.end();
       return;
     }
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const ip = req.socket?.remoteAddress || "unknown";
+    const failState = failedAuthByIp.get(ip);
+    if (failState && failState.until > Date.now()) {
+      const retryAfter = Math.ceil((failState.until - Date.now()) / 1000);
+      res.setHeader("Retry-After", String(retryAfter));
+      sendJson(res, 429, { error: "Too many failed authentication attempts" }, req);
+      return;
+    }
+
+    const authInfo = authenticateRequest(req);
 
     if (req.method === "GET" && url.pathname === "/health") {
-      sendJson(res, 200, {
-        ok: true,
-        vault: VAULT_DIR,
-        claude: fs.existsSync(CLAUDE_BIN),
-        agy: ENABLE_AGY && fs.existsSync(AGY_BIN),
-        opencode: fs.existsSync(OPENCODE_BIN),
-        stt: fs.existsSync(STT_WORKER),
-        tts: fs.existsSync(KOKORO_WORKER),
-      });
+      if (!authInfo) {
+        sendJson(res, 200, { ok: true, version: BRIDGE_VERSION }, req);
+        return;
+      }
+      sendJson(
+        res,
+        200,
+        {
+          ok: true,
+          version: BRIDGE_VERSION,
+          vault: VAULT_DIR,
+          claude: fs.existsSync(CLAUDE_BIN),
+          agy: ENABLE_AGY && fs.existsSync(AGY_BIN),
+          opencode: fs.existsSync(OPENCODE_BIN),
+          stt: fs.existsSync(STT_WORKER),
+          tts: fs.existsSync(KOKORO_WORKER),
+        },
+        req
+      );
+      return;
+    }
+
+    if (!authInfo) {
+      const hasAttemptedToken = Boolean(req.headers.authorization);
+      if (hasAttemptedToken) {
+        const prev = failedAuthByIp.get(ip) || { count: 0, until: 0 };
+        const count = prev.count + 1;
+        const delayMs = count >= AUTH_BACKOFF_THRESHOLD ? Math.min(60_000, 1000 * 2 ** (count - AUTH_BACKOFF_THRESHOLD)) : 0;
+        failedAuthByIp.set(ip, { count, until: Date.now() + delayMs });
+      }
+      auditLog({ ip, action: "auth_failed", path: url.pathname, status: 401 });
+      sendJson(res, 401, { error: "Unauthorized" }, req);
+      return;
+    }
+    failedAuthByIp.delete(ip);
+    if (authInfo.legacy) {
+      res.setHeader("X-Claudian-Warning", "Legacy token in use; re-pair device");
+    }
+
+    if (req.method === "GET" && url.pathname === "/devices") {
+      const devices = loadDevices().map(({ id, name, createdAt, lastUsedAt }) => ({
+        id,
+        name,
+        createdAt,
+        lastUsedAt,
+      }));
+      sendJson(res, 200, { ok: true, devices }, req);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/devices") {
+      const raw = await readBody(req, 64 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+      const name = String(body.name || "device").trim().slice(0, 64) || "device";
+      const id = crypto.randomUUID();
+      const token = crypto.randomBytes(24).toString("hex");
+      const devices = loadDevices();
+      devices.push({ id, name, tokenHash: sha256Hex(token), createdAt: Date.now(), lastUsedAt: null });
+      saveDevices(devices);
+      auditLog({ deviceId: authInfo.deviceId, ip, action: "device_create", targetId: id, name, status: 200 });
+      sendJson(res, 200, { ok: true, device: { id, name }, token }, req);
+      return;
+    }
+
+    const deviceDelMatch = url.pathname.match(/^\/devices\/([^/]+)$/);
+    if (req.method === "DELETE" && deviceDelMatch) {
+      const targetId = decodeURIComponent(deviceDelMatch[1]);
+      const devices = loadDevices();
+      const next = devices.filter((d) => d.id !== targetId);
+      if (next.length === devices.length) {
+        sendJson(res, 404, { error: "Device not found" }, req);
+        return;
+      }
+      saveDevices(next);
+      auditLog({ deviceId: authInfo.deviceId, ip, action: "device_revoke", targetId, status: 200 });
+      sendJson(res, 200, { ok: true, revoked: targetId }, req);
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/apk/version") {
       const { apkPath, metaPath } = resolveApkPaths();
       if (!fs.existsSync(apkPath)) {
-        sendJson(res, 404, { error: "APK not built yet" });
+        sendJson(res, 404, { error: "APK not built yet" }, req);
         return;
       }
       let versionCode = 1;
@@ -756,20 +979,22 @@ export function createServer(opts = {}) {
         // use defaults
       }
       const stat = fs.statSync(apkPath);
+      const sha256 = crypto.createHash("sha256").update(fs.readFileSync(apkPath)).digest("hex");
       sendJson(res, 200, {
         ok: true,
         versionCode,
         versionName,
         size: stat.size,
         mtimeMs: Math.round(stat.mtimeMs),
-      });
+        sha256,
+      }, req);
       return;
     }
 
     if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/apk") {
       const { apkPath } = resolveApkPaths();
       if (!fs.existsSync(apkPath)) {
-        sendJson(res, 404, { error: "APK not built yet" });
+        sendJson(res, 404, { error: "APK not built yet" }, req);
         return;
       }
       const stat = fs.statSync(apkPath);
@@ -786,9 +1011,194 @@ export function createServer(opts = {}) {
       return;
     }
 
-    const auth = req.headers.authorization || "";
-    if (auth !== `Bearer ${AUTH_TOKEN}`) {
-      sendJson(res, 401, { error: "Unauthorized" });
+    if (req.method === "GET" && url.pathname === "/approvals") {
+      sendJson(res, 200, { ok: true, approvals: jobManager.listApprovals() }, req);
+      return;
+    }
+
+    const approvalResolveMatch = url.pathname.match(/^\/approvals\/([^/]+)$/);
+    if (req.method === "POST" && approvalResolveMatch) {
+      const approvalId = decodeURIComponent(approvalResolveMatch[1]);
+      const raw = await readBody(req, 64 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+      const resolved = jobManager.resolveApproval(approvalId, body.decision);
+      if (!resolved) {
+        sendJson(res, 404, { error: "Approval not found" }, req);
+        return;
+      }
+      sendJson(res, 200, { ok: true, ...resolved }, req);
+      return;
+    }
+
+    const jobPermCheckMatch = url.pathname.match(/^\/jobs\/([^/]+)\/permission-check$/);
+    if (req.method === "POST" && jobPermCheckMatch) {
+      const jobId = decodeURIComponent(jobPermCheckMatch[1]);
+      const raw = await readBody(req, 256 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+      const result = await jobManager.requestApproval({
+        jobId,
+        tool: body.tool || "Bash",
+        input: body.input || {},
+      });
+      sendJson(res, 200, { ok: true, ...result }, req);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/jobs") {
+      sendJson(res, 200, { ok: true, jobs: jobManager.listJobs() }, req);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/jobs") {
+      const raw = await readBody(req, 1024 * 1024);
+      let body;
+      try { body = JSON.parse(raw.toString("utf8")); } catch {
+        sendJson(res, 400, { error: "Invalid JSON" }, req);
+        return;
+      }
+      const prompt = String(body.prompt || "").trim();
+      if (!prompt) {
+        sendJson(res, 400, { error: "Missing prompt" }, req);
+        return;
+      }
+      let workspaceDir;
+      try {
+        workspaceDir = resolveWorkspaceCwd(body.cwd);
+      } catch {
+        sendJson(res, 400, { error: "Invalid workspace path" }, req);
+        return;
+      }
+      const idempotencyKey = String(req.headers["idempotency-key"] || body.idempotencyKey || "").trim() || null;
+      const existing = idempotencyKey && jobManager.idempotencyIndex.has(idempotencyKey);
+      if (!existing && jobManager.activeCount() + activeAgentCount >= MAX_CONCURRENT_JOBS) {
+        sendJson(res, 429, { error: "Bridge is busy (max concurrent jobs reached)" }, req);
+        return;
+      }
+      const provider = String(body.provider || "claude").toLowerCase();
+      if (isAgyProvider(provider) && !ENABLE_AGY) {
+        sendJson(res, 400, { error: AGY_DISABLED_MESSAGE }, req);
+        return;
+      }
+      const { job, deduplicated } = jobManager.createAndStartJob({
+        prompt,
+        provider,
+        model: body.model || "",
+        cwd: workspaceDir,
+        sessionId: body.sessionId || null,
+        systemPrompt: body.systemPrompt || "",
+        idempotencyKey,
+      });
+      auditLog({ deviceId: authInfo.deviceId, ip, action: "job_create", jobId: job.id, workspace: workspaceDir, provider, status: 200 });
+      sendJson(res, 200, { ok: true, job, deduplicated }, req);
+      return;
+    }
+
+    const jobEventsMatch = url.pathname.match(/^\/jobs\/([^/]+)\/events$/);
+    if (req.method === "GET" && jobEventsMatch) {
+      const jobId = decodeURIComponent(jobEventsMatch[1]);
+      const job = jobManager.getJob(jobId);
+      if (!job) {
+        sendJson(res, 404, { error: "Job not found" }, req);
+        return;
+      }
+      setCors(res, req);
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      const lastId = Number(req.headers["last-event-id"] || url.searchParams.get("lastEventId") || 0) || 0;
+      const sendRec = (rec) => {
+        if (!res.writableEnded) {
+          res.write(`id: ${rec.id}\nevent: ${rec.event}\ndata: ${JSON.stringify(rec.data)}\n\n`);
+        }
+      };
+      const isTerminal = (ev) => ev === "done" || ev === "error" || ev === "cancelled";
+
+      for (const rec of jobManager.readEvents(jobId, lastId)) {
+        sendRec(rec);
+        if (isTerminal(rec.event)) {
+          if (!res.writableEnded) res.end();
+          return;
+        }
+      }
+      if (["succeeded", "failed", "cancelled", "interrupted"].includes(job.status)) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      const keepalive = setInterval(() => {
+        if (!res.writableEnded) { try { res.write(": keepalive\n\n"); } catch {} }
+      }, 15_000);
+      const unsub = jobManager.subscribe(jobId, (rec) => {
+        sendRec(rec);
+        if (isTerminal(rec.event)) {
+          clearInterval(keepalive);
+          unsub();
+          if (!res.writableEnded) res.end();
+        }
+      });
+      req.on("close", () => {
+        clearInterval(keepalive);
+        unsub();
+      });
+      return;
+    }
+
+    const jobCancelMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cancel$/);
+    if (req.method === "POST" && jobCancelMatch) {
+      const jobId = decodeURIComponent(jobCancelMatch[1]);
+      const job = jobManager.cancelJob(jobId);
+      if (!job) {
+        sendJson(res, 404, { error: "Job not found" }, req);
+        return;
+      }
+      auditLog({ deviceId: authInfo.deviceId, ip, action: "job_cancel", jobId, status: 200 });
+      sendJson(res, 200, { ok: true, job }, req);
+      return;
+    }
+
+    const jobMsgMatch = url.pathname.match(/^\/jobs\/([^/]+)\/message$/);
+    if (req.method === "POST" && jobMsgMatch) {
+      const jobId = decodeURIComponent(jobMsgMatch[1]);
+      const parentJob = jobManager.getJob(jobId);
+      if (!parentJob) {
+        sendJson(res, 404, { error: "Job not found" }, req);
+        return;
+      }
+      const raw = await readBody(req, 1024 * 1024);
+      let body = {};
+      try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+      const prompt = String(body.prompt || "").trim();
+      if (!prompt) {
+        sendJson(res, 400, { error: "Missing prompt" }, req);
+        return;
+      }
+      const idempotencyKey = String(req.headers["idempotency-key"] || body.idempotencyKey || "").trim() || null;
+      const { job, deduplicated } = jobManager.createAndStartJob({
+        prompt,
+        provider: parentJob.provider,
+        model: parentJob.model,
+        cwd: parentJob.cwd,
+        sessionId: parentJob.sessionId,
+        systemPrompt: body.systemPrompt || "",
+        idempotencyKey,
+      });
+      auditLog({ deviceId: authInfo.deviceId, ip, action: "job_message", jobId: job.id, parentJobId: jobId, status: 200 });
+      sendJson(res, 200, { ok: true, job, deduplicated }, req);
+      return;
+    }
+
+    const jobGetMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
+    if (req.method === "GET" && jobGetMatch) {
+      const jobId = decodeURIComponent(jobGetMatch[1]);
+      const job = jobManager.getJob(jobId);
+      if (!job) {
+        sendJson(res, 404, { error: "Job not found" }, req);
+        return;
+      }
+      sendJson(res, 200, { ok: true, job }, req);
       return;
     }
 
@@ -820,7 +1230,8 @@ export function createServer(opts = {}) {
         }
         const targetPath = path.join(WORKSPACES_ROOT, safeName);
         fs.mkdirSync(targetPath, { recursive: true });
-        sendJson(res, 200, { ok: true, workspace: { path: targetPath, name: safeName } });
+        auditLog({ deviceId: authInfo.deviceId, ip, action: "workspace_create", workspace: targetPath, status: 200 });
+        sendJson(res, 200, { ok: true, workspace: { path: targetPath, name: safeName } }, req);
       } catch (err) {
         sendJson(res, 400, { ok: false, error: err.message });
       }
@@ -1017,7 +1428,23 @@ export function createServer(opts = {}) {
         return;
       }
 
-      setCors(res);
+      let workspaceDir;
+      try {
+        workspaceDir = resolveWorkspaceCwd(body.cwd);
+      } catch (err) {
+        auditLog({ deviceId: authInfo.deviceId, ip, action: "chat_rejected", workspace: String(body.cwd || ""), status: 400 });
+        sendJson(res, 400, { error: "Invalid workspace path" }, req);
+        return;
+      }
+      if (activeAgentCount >= MAX_CONCURRENT_JOBS) {
+        auditLog({ deviceId: authInfo.deviceId, ip, action: "chat_busy", workspace: workspaceDir, status: 429 });
+        sendJson(res, 429, { error: "Bridge is busy (max concurrent jobs reached)" }, req);
+        return;
+      }
+      activeAgentCount++;
+      const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
+
+      setCors(res, req);
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1042,15 +1469,16 @@ export function createServer(opts = {}) {
       req.on("close", () => clearInterval(keepaliveTimer));
       res.on("finish", () => clearInterval(keepaliveTimer));
 
-      const requestedCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
-      const workspaceDir =
-        requestedCwd && fs.existsSync(requestedCwd) && fs.statSync(requestedCwd).isDirectory()
-          ? requestedCwd
-          : DEFAULT_WORKSPACE;
-      const isScopedWorkspace = workspaceDir !== DEFAULT_WORKSPACE;
-
       const provider = String(body.provider || "claude").toLowerCase();
+      let slotReleased = false;
+      const releaseSlot = () => {
+        if (!slotReleased) {
+          slotReleased = true;
+          activeAgentCount = Math.max(0, activeAgentCount - 1);
+        }
+      };
       if (isAgyProvider(provider) && !ENABLE_AGY) {
+        releaseSlot();
         writeEvent("error", { error: AGY_DISABLED_MESSAGE });
         res.end();
         return;
@@ -1147,9 +1575,11 @@ export function createServer(opts = {}) {
         }, 3000).unref();
       };
 
-      req.on("close", killChildGracefully);
+      // M2: client disconnect on /chat no longer kills the underlying agent process.
 
       child.on("error", (err) => {
+        releaseSlot();
+        auditLog({ deviceId: authInfo.deviceId, ip, action: "chat", workspace: workspaceDir, provider, status: 500 });
         if (!doneSent) {
           writeEvent("error", { error: `Failed to start ${provider}: ${err.message}` });
         }
@@ -1263,6 +1693,16 @@ export function createServer(opts = {}) {
       });
 
       child.on("close", (code) => {
+        releaseSlot();
+        auditLog({
+          deviceId: authInfo.deviceId,
+          ip,
+          action: "chat",
+          workspace: workspaceDir,
+          provider,
+          sessionId: activeSessionId,
+          status: code === 0 ? 200 : 500,
+        });
         if (code !== 0 && !fullText && !doneSent) {
           writeEvent("error", { error: errTail || `${provider} exited ${code}` });
         } else {
@@ -1421,6 +1861,9 @@ export function createServer(opts = {}) {
 
   // Start listening; resolves once bound (PORT is updated, so port 0 works).
   function start() {
+    if (HOST === "0.0.0.0" || (!HOST.startsWith("127.") && !HOST.startsWith("10.") && !HOST.startsWith("192.168.") && !HOST.startsWith("100.") && HOST !== "::1" && HOST !== "localhost")) {
+      console.warn(`[claudian-bridge] WARNING: binding to ${HOST} may expose the bridge beyond localhost/private interfaces; set CLAUDIAN_BIND to restrict.`);
+    }
     return new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, HOST, () => {
@@ -1448,6 +1891,7 @@ export function createServer(opts = {}) {
   // Full teardown for tests: workers, mDNS, in-flight agent children, sockets.
   function stop() {
     stopMdns();
+    jobManager.shutdown();
     sttWorker.dispose();
     ttsWorker.dispose();
     for (const child of activeChildren) {

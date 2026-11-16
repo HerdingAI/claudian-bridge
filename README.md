@@ -19,6 +19,7 @@ cd claudian-bridge
 6. Advertises `_claudian._tcp.local` via mDNS for LAN auto-discovery and prints a **scannable QR code** (`claudian://pair?url=...&token=...`) for 1-tap pairing in **Claudian Call** over LAN or Tailscale.
 
 > To run manually without `setup.sh`: `node server.mjs`
+> Diagnostics & device management: `./setup.sh doctor` and `./setup.sh devices [revoke <id>]`
 
 ## Configuration (Environment Variables)
 
@@ -47,7 +48,13 @@ cd claudian-bridge
 - `GET /sessions/:sessionId/messages` — Loads session history across all providers
 - `POST /sessions/:sessionId/recap` — Generates a 5-second spoken catch-up summary of recent turns
 - `POST /vault/save` — Saves a dated Markdown note (`{ title, content, workspace, sessionId }`) into `<CLAUDIAN_OBSIDIAN_VAULT>/Voice Notes/`
-- `POST /chat` — Streams SSE events (`session`, `status`, `text`, `done`, `error`) from `claude`, `agy`, or `opencode` in auto mode (`--permission-mode auto` / `--mode auto` / `--auto`) with spoken-first formatting, workspace isolation, and full web/MCP tool access
+- `POST /jobs` — Starts a persistent background job (`Idempotency-Key` deduplication)
+- `GET /jobs` / `GET /jobs/:id` — Lists or inspects background jobs
+- `GET /jobs/:id/events` — Streams SSE job events with `Last-Event-ID` replay
+- `POST /jobs/:id/cancel` / `POST /jobs/:id/message` — Cancels a job or sends a follow-up turn
+- `GET /approvals` / `POST /approvals/:id` — Lists or resolves (`allow` | `deny`) pending permission requests
+- `GET /devices` / `POST /devices` / `DELETE /devices/:id` — Manages hashed per-device Bearer tokens
+- `POST /chat` — Streams SSE events (`session`, `status`, `text`, `done`, `error`) from `claude`, `agy`, or `opencode` in auto mode (`--permission-mode auto` / `--mode auto` / `--auto`) with spoken-first formatting, workspace isolation, and full web/MCP tool access (client disconnect no longer kills the agent)
 - `POST /stt` — Transcribes 16 kHz WAV audio (`audio/wav` binary or `{ wavBase64, language }` JSON) via `faster-whisper` (CUDA with automatic CPU `int8` fallback)
 - `POST /tts` — Synthesizes WAV audio via Kokoro ONNX
 

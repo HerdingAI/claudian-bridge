@@ -3,6 +3,74 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Subcommand: ./setup.sh doctor
+if [[ "${1:-}" == "doctor" ]]; then
+  echo "=== Claudian Bridge Doctor ==="
+  node_bin="$(command -v node || true)"
+  if [[ -n "$node_bin" ]]; then
+    echo "  [OK] Node.js: $("$node_bin" -v)"
+  else
+    echo "  [FAIL] Node.js not found — install Node.js >= 20"
+  fi
+  for cli in claude opencode agy; do
+    if command -v "$cli" >/dev/null 2>&1; then
+      echo "  [OK] CLI $cli: $(command -v "$cli")"
+    else
+      echo "  [INFO] CLI $cli: not found on PATH"
+    fi
+  done
+  STT_VENV="${CLAUDIAN_STT_VENV:-$HOME/.venvs/audio}"
+  if [[ -x "$STT_VENV/bin/python3" ]] && "$STT_VENV/bin/python3" -c "import faster_whisper, kokoro_onnx" >/dev/null 2>&1; then
+    echo "  [OK] Audio venv: $STT_VENV (faster-whisper + kokoro-onnx)"
+  else
+    echo "  [WARN] Audio venv incomplete — run ./setup.sh"
+  fi
+  if [[ -f "$HOME/.config/claudian-bridge/config.json" ]]; then
+    echo "  [OK] Auth token: ~/.config/claudian-bridge/config.json"
+  else
+    echo "  [WARN] Auth token missing — run ./setup.sh"
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    echo "  [OK] Tailscale IP: ${ts_ip:-not connected}"
+  else
+    echo "  [INFO] Tailscale not installed"
+  fi
+  if curl -sf "http://127.0.0.1:${CLAUDIAN_BRIDGE_PORT:-8790}/health" >/dev/null 2>&1; then
+    echo "  [OK] Bridge listening on port ${CLAUDIAN_BRIDGE_PORT:-8790}"
+  else
+    echo "  [WARN] Bridge not responding on port ${CLAUDIAN_BRIDGE_PORT:-8790}"
+  fi
+  exit 0
+fi
+
+# Subcommand: ./setup.sh devices [revoke <id>]
+if [[ "${1:-}" == "devices" ]]; then
+  DEVICES_FILE="${CLAUDIAN_CONFIG_DIR:-$HOME/.config/claudian-bridge}/devices.json"
+  NODE_BIN="$(command -v node || true)"
+  [[ -n "$NODE_BIN" ]] || { echo "Error: node not found" >&2; exit 1; }
+  if [[ "${2:-}" == "revoke" && -n "${3:-}" ]]; then
+    "$NODE_BIN" -e '
+      const fs = require("fs"), f = process.argv[1], id = process.argv[2];
+      const list = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : [];
+      const next = list.filter(d => d.id !== id);
+      if (next.length === list.length) { console.error("Device not found:", id); process.exit(1); }
+      fs.writeFileSync(f, JSON.stringify(next, null, 2), { mode: 0o600 });
+      console.log("Revoked device:", id);
+    ' "$DEVICES_FILE" "$3"
+  else
+    "$NODE_BIN" -e '
+      const fs = require("fs"), f = process.argv[1];
+      const list = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : [];
+      if (!list.length) { console.log("No paired per-device tokens."); process.exit(0); }
+      for (const d of list) {
+        console.log(`${d.id}  ${d.name || "device"}  created=${new Date(d.createdAt || 0).toISOString()}`);
+      }
+    ' "$DEVICES_FILE"
+  fi
+  exit 0
+fi
+
 # Opt-in flags. Anything that edits global agent config stays off by default.
 WITH_CE=0
 for arg in "$@"; do
