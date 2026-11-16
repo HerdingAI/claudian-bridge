@@ -1468,6 +1468,9 @@ export function createServer(opts = {}) {
       }, 15_000);
       req.on("close", () => clearInterval(keepaliveTimer));
       res.on("finish", () => clearInterval(keepaliveTimer));
+      // On Node >= 20 `req` closes before this handler registers, and `finish` never fires when
+      // the client aborts, so without this the interval leaks and keeps the process alive.
+      res.on("close", () => clearInterval(keepaliveTimer));
 
       const provider = String(body.provider || "claude").toLowerCase();
       let slotReleased = false;

@@ -65,17 +65,20 @@ describe("POST /chat (characterization)", () => {
       assert.match(inv.argv[inv.argv.indexOf("--append-system-prompt") + 1], /Workspace Isolation/);
     });
 
-    test("a nonexistent cwd silently falls back to the default workspace", async () => {
-      await t.chat({ prompt: "hi", cwd: "/definitely/not/here" });
-      assert.equal(fs.realpathSync(lastClaude().cwd), fs.realpathSync(t.workspacesRoot));
+    test("a nonexistent cwd is rejected with 400 and spawns nothing", async () => {
+      const before = t.invocations().length;
+      const res = await t.post("/chat", { prompt: "hi", cwd: "/definitely/not/here" });
+      assert.equal(res.status, 400);
+      assert.equal(t.invocations().length, before);
     });
 
-    test("cwd OUTSIDE the workspaces root is accepted", async () => {
-      // KNOWN BUG — flips in M1/M2: any existing directory on the machine is honored as cwd.
+    test("cwd OUTSIDE the workspaces root is rejected with 400 and spawns nothing", async () => {
       const outside = fs.mkdtempSync(path.join(os.tmpdir(), "outside-"));
       try {
-        await t.chat({ prompt: "hi", cwd: outside });
-        assert.equal(fs.realpathSync(lastClaude().cwd), fs.realpathSync(outside));
+        const before = t.invocations().length;
+        const res = await t.post("/chat", { prompt: "hi", cwd: outside });
+        assert.equal(res.status, 400);
+        assert.equal(t.invocations().length, before);
       } finally {
         fs.rmSync(outside, { recursive: true, force: true });
       }
