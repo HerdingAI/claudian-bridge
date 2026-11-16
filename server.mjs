@@ -134,24 +134,30 @@ export function createServer(opts = {}) {
   ]);
 
   function resolveApkPaths() {
+    if (env.CLAUDIAN_CALL_APK) {
+      return {
+        apkPath: env.CLAUDIAN_CALL_APK,
+        metaPath: path.join(path.dirname(env.CLAUDIAN_CALL_APK), "output-metadata.json"),
+      };
+    }
     const candidates = [
-      env.CLAUDIAN_CALL_APK,
       path.join(__dirname, "claudian-call.apk"),
       path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/direct/debug/app-direct-debug.apk"),
-      path.resolve(__dirname, "../claudian-call/app/build/outputs/apk/debug/app-debug.apk"),
       path.resolve(__dirname, "../claudian-call/dist/claudian-call.apk"),
-    ].filter(Boolean);
-    for (const p of candidates) {
-      if (fs.existsSync(p)) {
-        return {
-          apkPath: p,
-          metaPath: path.join(path.dirname(p), "output-metadata.json"),
-        };
-      }
+    ].filter((p) => fs.existsSync(p));
+
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+      const newest = candidates[0];
+      return {
+        apkPath: newest,
+        metaPath: path.join(path.dirname(newest), "output-metadata.json"),
+      };
     }
+    const fallback = path.resolve(__dirname, "../claudian-call/dist/claudian-call.apk");
     return {
-      apkPath: candidates[candidates.length - 1],
-      metaPath: path.join(path.dirname(candidates[candidates.length - 1]), "output-metadata.json"),
+      apkPath: fallback,
+      metaPath: path.join(path.dirname(fallback), "output-metadata.json"),
     };
   }
 
